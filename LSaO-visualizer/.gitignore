@@ -1,0 +1,5 @@
+venv/
+__pycache__/
+*.pyc
+.cache/
+resources/temporary_file.mp4

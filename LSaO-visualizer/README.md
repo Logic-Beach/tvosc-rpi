@@ -1,0 +1,206 @@
+# LSaO Visualiser
+by [Aaron F. Bianchi](https://aaronfbianchi.github.io/) 
+
+Linear Spectrum and Oscilloscope Visualizer is an extremely fast audio visualization tool
+
+This tool can export videos of a linear spectrum, tuned short waveform, long waveform, X/Y oscilloscope, polar oscilloscope, recurrence plot, Poincaré plot or delay embedding plot of a song.  It supports multiple audio and video formats.
+
+Coded to look as **violent**, **responsive**, **snappy** and **rough** as possible. It draws a white visualizer over a black background for further processing with a video editor of your preference.
+
+Linear Spectrum:
+<div style="display: flex; justify-content: center; align-items: center; flex-wrap: wrap;">
+  <img src="https://github.com/aaronfbianchi/LSaO-visualizer/blob/main/img/example-spectrum.gif"
+       alt="Example Spectrum GIF"
+       style="max-width: 100%; height: auto; margin: 10px;">
+</div>
+Short Waveform:
+<div style="display: flex; justify-content: center; align-items: center; flex-wrap: wrap;">
+  <img src="https://github.com/aaronfbianchi/LSaO-visualizer/blob/main/img/example-short-waveform.gif"
+       alt="Example Short Waveform GIF"
+       style="max-width: 100%; height: auto; margin: 10px;">
+</div>
+Linear Spectrum (dB):
+<div style="display: flex; justify-content: center; align-items: center; flex-wrap: wrap;">
+  <img src="https://github.com/aaronfbianchi/LSaO-visualizer/blob/main/img/example-spectrum-dB.gif"
+       alt="Example Spectrum dB GIF"
+       style="max-width: 100%; height: auto; margin: 10px;">
+</div>
+Long Waveform:
+<div style="display: flex; justify-content: center; align-items: center; flex-wrap: wrap;">
+  <img src="https://github.com/aaronfbianchi/LSaO-visualizer/blob/main/img/example-long-waveform.gif"
+       alt="Example Long Waveform GIF"
+       style="max-width: 100%; height: auto; margin: 10px;">
+</div>
+Stereo Oscilloscope and Mono Polar Oscilloscope:
+<div style="display: flex; justify-content: center; align-items: center; flex-wrap: wrap;">
+  <img src="https://github.com/aaronfbianchi/LSaO-visualizer/blob/main/img/example-osc-github.gif"
+       alt="Example Stereo Oscilloscope GIF"
+       style="max-width: 100%; height: auto; margin: 0px;">
+  <img src="https://github.com/aaronfbianchi/LSaO-visualizer/blob/main/img/example-polar-github.gif"
+       alt="Example Polar Oscilloscope GIF"
+       style="max-width: 100%; height: auto; margin: 0px;">
+</div>
+Stereo Polar Oscilloscope (one audio source and various tunings):
+<div style="display: flex; justify-content: center; align-items: center; flex-wrap: wrap;">
+  <img src="https://github.com/aaronfbianchi/LSaO-visualizer/blob/main/img/example-polar-stereo.gif"
+       alt="Example Stereo Polar Oscilloscope GIF"
+       style="max-width: 100%; height: auto; margin: 10px;">
+</div>
+Mono Polar Oscilloscope and Stereo Polar Oscilloscope:
+<div style="display: flex; justify-content: center; align-items: center; flex-wrap: wrap;">
+  <img src="https://github.com/aaronfbianchi/LSaO-visualizer/blob/main/img/example-polar-death.gif"
+       alt="Example Polar Oscilloscope (Violent) GIF"
+       style="max-width: 100%; height: auto; margin: 0px;">
+  <img src="https://github.com/aaronfbianchi/LSaO-visualizer/blob/main/img/example-polar-stereo-death.gif"
+       alt="Example Stereo Polar Oscilloscope (Violent) GIF"
+       style="max-width: 100%; height: auto; margin: 0px;">
+</div>
+Linear Spectral Balance and Recurrence Plot:
+<div style="display: flex; justify-content: center; align-items: center; flex-wrap: wrap;">
+  <img src="https://github.com/aaronfbianchi/LSaO-visualizer/blob/main/img/example-balance-github.gif"
+       alt="Example Spectral Balance GIF"
+       style="max-width: 100%; height: auto; margin: 10px;">
+  <img src="https://github.com/aaronfbianchi/LSaO-visualizer/blob/main/img/example-recurrence.gif"
+       alt="Example Recurrence Plot GIF"
+       style="max-width: 100%; height: auto; margin: 0px;">
+</div>
+Poincaré Plot and Delay Embedding Plot:
+<div style="display: flex; justify-content: center; align-items: center; flex-wrap: wrap;">
+  <img src="https://github.com/aaronfbianchi/LSaO-visualizer/blob/main/img/example-poincare.gif"
+       alt="Example Poincaré Plot GIF"
+       style="max-width: 100%; height: auto; margin: 10px;">
+  <img src="https://github.com/aaronfbianchi/LSaO-visualizer/blob/main/img/example-embed.gif"
+       alt="Example Delay Embedding Plot GIF"
+       style="max-width: 100%; height: auto; margin: 0px;">
+</div>
+Histogram Visualizer:
+<div style="display: flex; justify-content: center; align-items: center; flex-wrap: wrap;">
+  <img src="https://github.com/aaronfbianchi/LSaO-visualizer/blob/main/img/example-histogram.gif"
+       alt="Example Histogram GIF"
+       style="max-width: 100%; height: auto; margin: 10px;">
+</div>
+Chladni Plate Visualizer:
+<div style="display: flex; justify-content: center; align-items: center; flex-wrap: wrap;">
+  <img src="https://github.com/aaronfbianchi/LSaO-visualizer/blob/main/img/example-chladni.gif"
+       alt="Example Chladni Plate GIF"
+       style="max-width: 100%; height: auto; margin: 10px;">
+</div>
+Envelope Visualizer:
+<div style="display: flex; justify-content: center; align-items: center; flex-wrap: wrap;">
+  <img src="https://github.com/aaronfbianchi/LSaO-visualizer/blob/main/img/example-envelope.gif"
+       alt="Example Envelope GIF"
+       style="max-width: 100%; height: auto; margin: 10px;">
+</div>
+
+
+Bunch of demo videos
+---------------------
+* [Hellhacker](https://www.youtube.com/watch?v=upkUpTIws48) by Aaron F. Bianchi
+* [Slaying With Portals](https://www.youtube.com/watch?v=IIGqghktYas) by Aaron F. Bianchi
+* [The Forbidden Dance](https://www.youtube.com/watch?v=qKTOINiTxGw) by The Hamster Alliance
+* [Nailgun](https://www.youtube.com/watch?v=buWPKEcAkw8) by Aaron F. Bianchi
+* [Deathmatch EP](https://www.youtube.com/watch?v=_H94n6kc204) by Aaron F. Bianchi
+* [Blip](https://youtu.be/unIQeniWOp0) by The Hamster Alliance
+* [Death Itself](https://youtu.be/11eqIOSgt0w?si=JjFL0j3CZkbPQk2i) by Aaron F. Bianchi
+
+Why?
+---------------------
+This small project started due to the omnipresence of logarithmic spectrum visualizers and the apparent absence of linear spectrum visualizers (apart from the one in After Effects, but who wants to install an Adobe product anyway).
+
+Download
+---------------------
+You can download it [here](https://github.com/aaronfbianchi/LSaO-visualizer/releases).
+
+Installation
+---------------------
+You don't need to install it. Just double click the executable.
+
+CRT kiosk (this fork)
+---------------------
+`kiosk.py` is a fullscreen live viewer for Raspberry Pi / composite CRT use:
+
+```
+python3 kiosk.py
+```
+
+It draws every LSaO live mode at 24 fps, rendering internally at a reduced resolution then nearest-neighbor scaling to 720×480. Heavy modes (recurrence, Chladni) start even smaller and shrink further if a frame misses the 24 fps budget. SIGUSR2 (or the `n` key) cycles visualizer types.
+
+Live Audio Visualiztion
+---------------------
+**For Linux:**
+
+You can select which audio stream you want to visualize with Pavucontrol. Just set that source as fallback in the "Input Devices" tab. 
+
+- Set as fallback "Monitor" to visualize Desktop Audio.
+- Set as fallback Internal Microphone or your audio interface for actual audio inputs.
+
+<img width="865" height="369" alt="image" src="https://github.com/user-attachments/assets/cde18d65-39cf-44ea-a967-bb571e5beabf" />
+
+**For Windows:**
+
+- Search for "Sound settings"
+
+<img width="233" height="213" alt="image" src="https://github.com/user-attachments/assets/84020ae1-d011-44eb-926b-0ac6da64f6e2" />
+
+- Advanced -> More sound settings
+
+<img width="326" height="347" alt="image" src="https://github.com/user-attachments/assets/5796f39b-95ee-4bb8-85ff-dba6ce8dfe19" />
+
+- For Desktop Audio, you can select which audio stream you want to visualize in the "Playback" tab by setting it as default.
+
+<img width="400" height="454" alt="image" src="https://github.com/user-attachments/assets/84aac436-b8ad-4ed5-9457-022698813853" />
+
+- For live microphone input (or any other audio source like an audio interface), go to the "Recording" tab and double click on the device you want to use.
+
+<img width="395" height="451" alt="image" src="https://github.com/user-attachments/assets/8f99f074-e34d-4777-98b8-b1e843fee6b8" />
+
+- In the "Listen" tab, check "Listen to this Device" and then press OK/Apply.
+
+<img width="398" height="445" alt="image" src="https://github.com/user-attachments/assets/383b1178-7706-4f27-9a92-48b7b86db1e4" />
+
+
+Things to know
+---------------------
+* The Windows releases of this software bundle FFmpeg (https://ffmpeg.org/). Nevertheless, if for any reason it's missing, it will try to use the FFmpeg in PATH if already installed. FFmpeg is licensed under the GNU General Public License version 3 (GPL v3). Prebuilt binaries used in this project are from Gyan.dev (https://www.gyan.dev/ffmpeg/builds/). The FFmpeg source code is available at https://ffmpeg.org/download.html#source
+
+* The Stereo X/Y and Polar Visualizers only work with stereo files as it wouldn't make any sense to visualize a mono file with a stereo oscilloscope.
+
+Tips if using on Windows
+-------------------------
+* The default Windows video player is not gonna play the exported videos correctly. Try another video player instead (Like VLC, for example). You'll be able to use the exported videos in any video editing software just fine, though.
+
+
+Running from source
+---------------------
+Being a Python 3.11.2 program, you'll need some libraries, which you can see in the "requirements.txt" file. To install them, run these commands.
+
+For Linux:
+
+    # For setting up your virtual environment
+    python3 -m venv venv
+    source venv/bin/activate
+
+    # For installing the libraries
+    pip install -r requirements.txt
+
+For Windows:
+
+    # For setting up your virtual environment
+    python3 -m venv venv
+    venv\Scripts\activate
+
+    # For installing the libraries
+    pip install -r requirements.txt
+
+Aditionally, if you want to create an executable from source, these libraries have worked for me:
+* cx_Freeze v6.15.14 (For Linux)
+* pyinstaller v6.3.0 (For Windows)
+
+For creating executable from Linux:
+
+    python setup.py build
+
+For creating executable from Windows:
+
+    pyinstaller --onefile --console main.py
+
