@@ -1369,7 +1369,7 @@ def generate_waveform_long(output_name,input_audio,channel,fps, res_width, res_h
     callback_function(i,n_frames, text_state = True, text_message = "Done, my dood!")
     return 0
 
-oldWaveLive = np.zeros((180, 2))
+oldWaveLive = np.zeros((90, 2))
 
 def live_waveform_long(block, channel, res_width, res_height, thickness):
 
@@ -1391,7 +1391,8 @@ def live_waveform_long(block, channel, res_width, res_height, thickness):
 
     frameData = np.zeros((res_height, res_width), dtype=bool)
 
-    hist = max(32, min(int(res_width), 180))
+    # ~1.5s of peak history at 60 fps (was 3s / 180 samples).
+    hist = max(32, min(int(res_width), 90))
     if oldWaveLive.shape[0] != hist:
         oldWaveLive = np.zeros((hist, 2), dtype=np.float64)
 

@@ -1,0 +1,14 @@
+polkit.addRule(function(action, subject) {
+    if (subject.user !== "pi") {
+        return;
+    }
+    var ids = [
+        "org.freedesktop.udisks2.filesystem-mount",
+        "org.freedesktop.udisks2.filesystem-mount-other-seat",
+        "org.freedesktop.udisks2.filesystem-mount-system",
+        "org.freedesktop.udisks2.filesystem-fstab"
+    ];
+    if (ids.indexOf(action.id) !== -1) {
+        return polkit.Result.YES;
+    }
+});
