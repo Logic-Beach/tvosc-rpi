@@ -208,7 +208,7 @@ STARFIELD_MIN_STARS = 72
 STARFIELD_NEAR_Z = 0.08
 STARFIELD_FAR_Z = 4.8
 STARFIELD_SPEED = 0.72
-STARFIELD_HIGH_FULL = 0.04
+STARFIELD_HIGH_FULL = 0.025
 _starfield_rng = np.random.default_rng(1983)
 _starfield_x = _starfield_rng.uniform(-1.25, 1.25, STARFIELD_MAX_STARS)
 _starfield_y = _starfield_rng.uniform(-1.25, 1.25, STARFIELD_MAX_STARS)
@@ -988,8 +988,11 @@ def starfield_zoom(block: np.ndarray, width: int, height: int) -> np.ndarray:
         0.0,
         1.0,
     )
-    brightness = np.rint(
-        (24.0 + 231.0 * high) * (0.20 + 0.80 * np.power(depth, 0.55))
+    proximity = np.power(depth, 0.70)
+    brightness = np.clip(
+        np.rint(4.0 + proximity * (20.0 + 320.0 * high)),
+        0.0,
+        255.0,
     ).astype(np.uint8)
 
     dx = x1 - x0
