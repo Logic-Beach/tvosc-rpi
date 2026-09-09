@@ -67,6 +67,7 @@ MIN_DIM = INTERNAL
 DEFAULT_MODE = "Waveform"  # Short Waveform
 
 pending_next = False
+pending_prev = False
 latest_block: np.ndarray | None = None
 _audio_stream = None
 _audio_proc: subprocess.Popen | None = None
@@ -75,23 +76,27 @@ AFFECT_FIFO = Path.home() / ".local/state" / "lsao-next"
 BACKEND_FILE = Path.home() / ".config" / "lsao" / "backend"
 _fifo_fd: int | None = None
 
-# Triggered waveform: analog-scope rising-edge lock.
-# Bass LP is only for period/holdoff so harmonics don't steal the edge.
-# Group-delay is backed out, then the start snaps to the raw rising zero.
+# Triggered waveform: a real scope trigger over 30–150 Hz. The filtered signal
+# only decides where a sweep starts; the displayed signal is always fresh,
+# unfiltered audio. A Schmitt-armed upward zero crossing is stable even when
+# the raw synth has large, moving harmonics.
 RING_SAMPLES = 16384
-TRIG_WINDOW = 6000
-TRIG_WINDOW_MIN = 4000
-TRIG_WINDOW_MAX = 8000
-TRIG_CYCLES = 5.0
+# Free-running short trace: ~30 ms of audio (was one ~5 ms capture chunk).
+SHORT_WINDOW = 1440
+TRIG_WINDOW = 2400
+TRIG_WINDOW_MIN = 640
+TRIG_WINDOW_MAX = 3600
+TRIG_CYCLES = 2.0
 TRIG_SEARCH = 2400
 TRIG_NEED = TRIG_WINDOW_MAX + TRIG_SEARCH
-TRIG_HYST = 0.03
-TRIG_HOLDOFF = 0.82
-TRIG_LP_HZ = 55.0
-TRIG_FMIN = 28.0
-TRIG_FMAX = 110.0
-TRIG_DS = 8
-_period_skip = 0
+TRIG_GATE_MIN = 0.0015
+TRIG_GATE_FRAC = 0.12
+TRIG_LP_HZ = 180.0
+TRIG_LP_POLES = 4
+TRIG_FMIN = 30.0
+TRIG_FMAX = 150.0
+TRIG_PERIOD_TOL = 0.14
+_sticky_win = 0
 _ring = np.zeros((RING_SAMPLES, 2), dtype=np.float32)
 _lp = np.zeros(RING_SAMPLES, dtype=np.float32)
 _ring_i = 0
@@ -100,8 +105,7 @@ _ring_lock = threading.Lock()
 _lp_alpha = float(1.0 - np.exp(-2.0 * np.pi * TRIG_LP_HZ / 48000.0))
 _lp_b = np.array([_lp_alpha], dtype=np.float64)
 _lp_a = np.array([1.0, _lp_alpha - 1.0], dtype=np.float64)
-_lp_zi1 = np.zeros(1, dtype=np.float64)
-_lp_zi2 = np.zeros(1, dtype=np.float64)
+_lp_zi = [np.zeros(1, dtype=np.float64) for _ in range(TRIG_LP_POLES)]
 _total = 0
 _period = 0.0
 
@@ -109,6 +113,11 @@ _period = 0.0
 def request_next(*_args) -> None:
     global pending_next
     pending_next = True
+
+
+def request_prev(*_args) -> None:
+    global pending_prev
+    pending_prev = True
 
 
 def open_affect_fifo() -> None:
@@ -121,15 +130,24 @@ def open_affect_fifo() -> None:
     _fifo_fd = os.open(AFFECT_FIFO, os.O_RDWR | os.O_NONBLOCK)
 
 
-def fifo_has_pulse() -> bool:
+def fifo_step() -> int:
+    """+1 next, -1 previous, 0 none."""
     if _fifo_fd is None:
-        return False
+        return 0
     try:
-        return bool(os.read(_fifo_fd, 256))
+        data = os.read(_fifo_fd, 256)
     except BlockingIOError:
-        return False
+        return 0
     except OSError:
-        return False
+        return 0
+    if not data:
+        return 0
+    for c in data:
+        if c in (ord("p"), ord("P")):
+            return -1
+        if c in (ord("n"), ord("N"), ord("x"), ord("X")):
+            return 1
+    return 1
 
 
 def to_u8(frame: np.ndarray) -> np.ndarray:
@@ -195,16 +213,17 @@ def prep_block(block: np.ndarray) -> np.ndarray:
 
 def push_audio(block: np.ndarray) -> None:
     """Keep a rolling stereo ring for triggered waveform (and latest_block)."""
-    global latest_block, _ring_i, _ring_filled, _lp_zi1, _lp_zi2, _total
+    global latest_block, _ring_i, _ring_filled, _lp_zi, _total
     b = stereo_block(np.asarray(block, dtype=np.float32))
     if b.size == 0:
         return
     latest_block = b
     n = min(int(b.shape[0]), RING_SAMPLES)
     b = b[-n:]
-    y1, _lp_zi1 = lfilter(_lp_b, _lp_a, np.mean(b, axis=1), zi=_lp_zi1)
-    y2, _lp_zi2 = lfilter(_lp_b, _lp_a, y1, zi=_lp_zi2)
-    filt = np.asarray(y2, dtype=np.float32)
+    y = np.mean(b, axis=1)
+    for k in range(TRIG_LP_POLES):
+        y, _lp_zi[k] = lfilter(_lp_b, _lp_a, y, zi=_lp_zi[k])
+    filt = np.asarray(y, dtype=np.float32)
     with _ring_lock:
         i = _ring_i
         first = min(n, RING_SAMPLES - i)
@@ -265,56 +284,18 @@ def smooth_scope(stereo: np.ndarray, width: int, height: int) -> np.ndarray:
 
 
 def _window_len(period: float, available: int) -> int:
+    global _sticky_win
     if period >= 16:
         win = int(round(TRIG_CYCLES * period))
     else:
         win = TRIG_WINDOW
     win = int(np.clip(win, TRIG_WINDOW_MIN, TRIG_WINDOW_MAX))
-    return max(64, min(win, available - 16))
-
-
-def _first_ac_lag(region: np.ndarray, energy: float) -> int:
-    """Prefer the fundamental lag, not 2×T, when both correlate."""
-    peak = float(np.max(region))
-    if peak < 0.28 * energy:
-        return -1
-    thr = 0.65 * peak
-    if region.size < 3:
-        return int(np.argmax(region))
-    loc = (region[1:-1] >= region[:-2]) & (region[1:-1] >= region[2:]) & (region[1:-1] >= thr)
-    found = np.flatnonzero(loc)
-    if found.size == 0:
-        return int(np.argmax(region))
-    return int(found[0]) + 1
-
-
-def _estimate_period(filt: np.ndarray, fs: float) -> float:
-    ds = max(1, int(TRIG_DS))
-    x = np.asarray(filt[-4096:], dtype=np.float32)
-    if x.size < 256:
-        return 0.0
-    x = x[::ds]
-    x = x - float(np.mean(x))
-    energy = float(np.dot(x, x))
-    if energy < 1e-8:
-        return 0.0
-    min_lag = max(2, int(round(fs / (TRIG_FMAX * ds))))
-    max_lag = min(int(x.size) - 2, int(round(fs / (TRIG_FMIN * ds))))
-    if max_lag <= min_lag + 2:
-        return 0.0
-    ac = np.correlate(x, x, mode="full")
-    mid = int(x.size) - 1
-    region = ac[mid + min_lag : mid + max_lag + 1]
-    k = _first_ac_lag(region, energy)
-    if k < 0:
-        return 0.0
-    lag = float(min_lag + k)
-    if 0 < k < region.size - 1:
-        a, b, c = float(region[k - 1]), float(region[k]), float(region[k + 1])
-        den = a - 2.0 * b + c
-        if abs(den) > 1e-12:
-            lag += 0.5 * (a - c) / den
-    return lag * ds
+    win = max(64, min(win, available - 16))
+    if _sticky_win >= 64 and abs(win - _sticky_win) < 0.18 * _sticky_win:
+        win = min(_sticky_win, available - 16)
+    else:
+        _sticky_win = win
+    return win
 
 
 def _smooth_period(measured: float) -> float:
@@ -325,52 +306,66 @@ def _smooth_period(measured: float) -> float:
         _period = measured
         return _period
     rel = abs(measured - _period) / _period
-    if rel < 0.18:
-        _period = 0.88 * _period + 0.12 * measured
-    elif abs(measured - 2.0 * _period) / _period < 0.12:
-        pass
-    elif abs(2.0 * measured - _period) / _period < 0.12:
-        _period = 0.6 * _period + 0.4 * measured
+    if rel < 0.08:
+        _period = 0.85 * _period + 0.15 * measured
     else:
+        # Two matching trigger intervals are enough evidence of a new note.
+        # Do not glue the tracker to the previous pitch.
         _period = measured
     return _period
 
 
-def _lp_delay_samples() -> int:
-    a = float(_lp_alpha)
-    if a <= 1e-6:
-        return 0
-    return int(round(2.0 * (1.0 - a) / a))
+def _scope_crossings(x: np.ndarray, gate: float) -> np.ndarray:
+    """Return upward zero crossings armed by a real negative excursion.
 
-
-def _rising_hits(x: np.ndarray, hyst: float, end: int | None = None) -> np.ndarray:
-    if end is None:
-        end = int(x.size) - 1
-    end = min(int(end), int(x.size) - 1)
-    if end < 1:
+    Unlike peak selection, the trigger point does not move when the relative
+    strength of a synth's fundamental and crunchy harmonics changes.
+    """
+    if x.size < 3:
         return np.empty(0, dtype=np.int64)
-    return np.flatnonzero((x[:end] < -hyst) & (x[1 : end + 1] >= hyst)).astype(np.int64)
+    zeros = np.flatnonzero((x[:-1] <= 0.0) & (x[1:] > 0.0)).astype(np.int64) + 1
+    if zeros.size == 0:
+        return zeros
+    hits: list[int] = []
+    start = 0
+    for crossing in zeros:
+        crossing = int(crossing)
+        if crossing > start and float(np.min(x[start:crossing])) <= -gate:
+            hits.append(crossing)
+        start = crossing
+    return np.asarray(hits, dtype=np.int64)
 
 
-def _holdoff_hits(hits: np.ndarray, period: float) -> np.ndarray:
-    """Keep one rising edge per bass period (latest in each cluster)."""
-    if hits.size == 0 or period < 16:
-        return hits
-    gap = max(8, int(round(TRIG_HOLDOFF * period)))
-    kept: list[int] = [int(hits[0])]
-    for h in hits[1:]:
-        h = int(h)
-        if h - kept[-1] >= gap:
-            kept.append(h)
-        else:
-            kept[-1] = h
-    return np.asarray(kept, dtype=np.int64)
+def _period_from_crossings(hits: np.ndarray, fs: float) -> float:
+    """Use the newest pair of mutually consistent trigger intervals."""
+    if hits.size < 3:
+        return 0.0
+    gaps = np.diff(hits.astype(np.float64))
+    min_period = fs / TRIG_FMAX
+    max_period = fs / TRIG_FMIN
+    for end in range(int(gaps.size) - 1, 0, -1):
+        a = float(gaps[end - 1])
+        b = float(gaps[end])
+        if not (min_period <= a <= max_period and min_period <= b <= max_period):
+            continue
+        center = 0.5 * (a + b)
+        if abs(a - b) > TRIG_PERIOD_TOL * center:
+            continue
+        run = [a, b]
+        for j in range(end - 2, max(-1, end - 5), -1):
+            g = float(gaps[j])
+            med = float(np.median(run))
+            if min_period <= g <= max_period and abs(g - med) <= TRIG_PERIOD_TOL * med:
+                run.append(g)
+            else:
+                break
+        return float(np.median(run))
+    return 0.0
 
 
 def locked_window() -> np.ndarray:
-    """Rising-edge lock with bass-period holdoff; start on the visible rise."""
-    global _period_skip
-    stereo, filt, _unused = ring_tail(TRIG_NEED)
+    """Draw fresh raw audio starting at a stable filtered zero crossing."""
+    stereo, filt, _total = ring_tail(TRIG_NEED)
     n = int(stereo.shape[0])
     if n < TRIG_WINDOW_MIN + 16:
         return stereo
@@ -379,39 +374,25 @@ def locked_window() -> np.ndarray:
         stereo = stereo[-need:]
         filt = filt[-need:]
         n = need
-    if float(np.max(np.abs(filt))) < TRIG_HYST * 2:
-        return stereo[-_window_len(0.0, n) :]
+    centered = np.asarray(filt, dtype=np.float32)
+    level = float(np.percentile(np.abs(centered[-4096:]), 90))
+    if level < TRIG_GATE_MIN:
+        return stereo[-_window_len(_period, n) :]
+    gate = max(TRIG_GATE_MIN, TRIG_GATE_FRAC * level)
+    hits = _scope_crossings(centered, gate)
     fs = float(lsao.SAMPLERATE)
-    _period_skip += 1
-    if _period <= 0.0 or _period_skip % 3 == 0:
-        T = _smooth_period(_estimate_period(filt, fs))
-    else:
-        T = _period
+    measured = _period_from_crossings(hits, fs)
+    T = _smooth_period(measured)
     window = _window_len(T, n)
-    delay = min(_lp_delay_samples(), max(0, window // 5))
+    tail = stereo[-window:]
     search_end = n - window
-    if search_end <= delay + 8:
-        return stereo[-window:]
-    hits = _rising_hits(filt, TRIG_HYST, search_end)
-    hits = hits[hits >= delay]
-    if T >= 16:
-        hits = _holdoff_hits(hits, T)
-    if hits.size == 0:
-        return stereo[-window:]
-    i = int(hits[-1]) - delay
-    mono = np.mean(stereo, axis=1)
-    slop = max(12, int(T * 0.12)) if T >= 16 else 32
-    lo = max(0, i - slop)
-    hi = min(search_end, i + slop)
-    peak = float(np.max(np.abs(mono[lo : hi + 2]))) if hi > lo else 0.0
-    hyst_r = max(0.015, min(TRIG_HYST, 0.12 * peak if peak > 1e-6 else TRIG_HYST))
-    raw_hits = _rising_hits(mono[lo : hi + 2], hyst_r)
-    if raw_hits.size:
-        cand = raw_hits.astype(np.int64) + lo
-        cand = cand[(cand >= 0) & (cand <= search_end)]
-        if cand.size:
-            i = int(cand[np.argmin(np.abs(cand - i))])
-    i = int(np.clip(i, 0, search_end))
+    if search_end <= 16 or T < 16 or hits.size == 0:
+        return tail
+    eligible = hits[hits <= search_end]
+    if eligible.size == 0:
+        return tail
+    # The newest complete sweep is new raw input; no held/copied frame exists.
+    i = int(eligible[-1])
     return stereo[i : i + window]
 
 
@@ -433,7 +414,10 @@ def render_frame(mode: str, block: np.ndarray, width: int, height: int) -> np.nd
                 block, CHANNEL, w, h, 64, 0.1, "Flat", "Filled Histogram", 1
             )
         case "Waveform":
-            return lsao.live_waveform(block, CHANNEL, w, h, "Curve", 1)
+            tail, _, _ = ring_tail(SHORT_WINDOW)
+            if tail.shape[0] < 8:
+                tail = block
+            return smooth_scope(tail, w, h)
         case "WaveformTrig":
             return smooth_scope(locked_window(), w, h)
         case "LongWaveform":
@@ -689,11 +673,11 @@ class Kiosk:
     def mode(self) -> str:
         return MODES[self.mode_index]
 
-    def advance(self) -> None:
-        self.mode_index = (self.mode_index + 1) % len(MODES)
+    def advance(self, step: int = 1) -> None:
+        self.mode_index = (self.mode_index + int(step)) % len(MODES)
 
     def _poll_input(self) -> bool:
-        global pending_next
+        global pending_next, pending_prev
         running = True
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
@@ -703,14 +687,21 @@ class Kiosk:
                     running = False
                 elif event.key == pygame.K_n:
                     request_next()
-        pulsed = fifo_has_pulse()
+                elif event.key == pygame.K_p:
+                    request_prev()
+        step = 0
         if pending_next:
             pending_next = False
-            pulsed = True
+            step = 1
+        elif pending_prev:
+            pending_prev = False
+            step = -1
+        else:
+            step = fifo_step()
         now = time.time()
-        if pulsed and (now - self.last_advance) >= NEXT_LOCKOUT_S:
+        if step and (now - self.last_advance) >= NEXT_LOCKOUT_S:
             self.last_advance = now
-            self.advance()
+            self.advance(step)
         return running
 
     def draw(self) -> None:

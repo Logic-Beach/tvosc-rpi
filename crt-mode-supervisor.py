@@ -2,7 +2,8 @@
 """GPIO kiosk supervisor: LSaO visualizer and USB VLC.
 
 GPIO 27 (header pin 13) to GND: toggle LSaO <-> USB video.
-GPIO 22 (header pin 15) to GND: next LSaO visualizer (ignored during video).
+GPIO 22 (header pin 15) to GND: short press next LSaO vis, hold to go back
+(ignored during video).
 Boot default is LSaO.
 """
 
@@ -42,6 +43,7 @@ AFFECT_PIN = 22
 BOUNCE_S = 0.03
 SWITCH_LOCKOUT_S = 1.0
 AFFECT_LOCKOUT_S = 0.08
+AFFECT_HOLD_S = 0.4
 HEAVY_PIXELS = 1280 * 720
 LSAO_DIR = HOME / "LSaO-visualizer"
 
@@ -78,15 +80,15 @@ def acquire_pidfile() -> int:
     return fd
 
 
-def poke_lsao_next() -> None:
-    """One FIFO pulse. The kiosk drains extra bytes as a single vis change."""
+def poke_lsao(step: bytes) -> None:
+    """Pulse the kiosk FIFO: b'n' next, b'p' previous."""
     LSAO_FIFO.parent.mkdir(parents=True, exist_ok=True)
     if not LSAO_FIFO.exists():
         os.mkfifo(LSAO_FIFO, 0o600)
     try:
         fd = os.open(LSAO_FIFO, os.O_RDWR | os.O_NONBLOCK)
         try:
-            os.write(fd, b"x")
+            os.write(fd, step)
         finally:
             os.close(fd)
     except OSError as exc:
@@ -455,6 +457,7 @@ class ModeSupervisor:
         self.pending_toggle = False
         self.pending_affect = False
         self.affect_held = False
+        self.affect_long = False
         self.playing_cached = False
         self.current_sources: list[Path] = []
         self.stop_transcode = threading.Event()
@@ -469,15 +472,23 @@ class ModeSupervisor:
             return
         self.pending_toggle = True
 
-    def request_affect(self) -> None:
-        # Momentary: one vis change per hold. Next press works as soon as it is released.
+    def request_affect(self, *_args) -> None:
         if self.affect_held:
             return
         self.affect_held = True
-        self.affect()
+        self.affect_long = False
 
-    def release_affect(self) -> None:
+    def affect_held_cb(self, *_args) -> None:
+        if not self.affect_held or self.affect_long:
+            return
+        self.affect_long = True
+        self.affect(-1)
+
+    def release_affect(self, *_args) -> None:
+        if self.affect_held and not self.affect_long:
+            self.affect(1)
         self.affect_held = False
+        self.affect_long = False
 
     def kill_visuals(self) -> None:
         kill_proc(self.lsao, "lsao")
@@ -607,10 +618,18 @@ class ModeSupervisor:
             if self.stop_transcode.wait(10.0):
                 return
 
-    def affect(self) -> None:
+    def affect(self, step: int = 1) -> None:
+        now = time.time()
+        if (now - self.last_affect) < AFFECT_LOCKOUT_S:
+            return
         if self.mode == "lsao" and self.lsao is not None and self.lsao.poll() is None:
-            poke_lsao_next()
-            logging.info("lsao: next visualizer")
+            self.last_affect = now
+            if step < 0:
+                poke_lsao(b"p")
+                logging.info("lsao: previous visualizer")
+            else:
+                poke_lsao(b"n")
+                logging.info("lsao: next visualizer")
         else:
             logging.info("affect ignored in mode=%s", self.mode)
 
@@ -641,13 +660,20 @@ def main() -> int:
 
     button = Button(GPIO_PIN, pull_up=True, bounce_time=BOUNCE_S)
     button.when_pressed = sup.request_toggle
-    affect = Button(AFFECT_PIN, pull_up=True, bounce_time=BOUNCE_S)
+    affect = Button(
+        AFFECT_PIN,
+        pull_up=True,
+        bounce_time=BOUNCE_S,
+        hold_time=AFFECT_HOLD_S,
+        hold_repeat=False,
+    )
     affect.when_pressed = sup.request_affect
+    affect.when_held = sup.affect_held_cb
     affect.when_released = sup.release_affect
     signal.signal(signal.SIGUSR1, lambda *_: sup.request_toggle())
-    signal.signal(signal.SIGUSR2, lambda *_: sup.affect())
+    signal.signal(signal.SIGUSR2, lambda *_: sup.affect(1))
     logging.info(
-        "GPIO %s toggles LSaO/VLC; GPIO %s cycles LSaO visualizers",
+        "GPIO %s toggles LSaO/VLC; GPIO %s short=next vis, hold=previous",
         GPIO_PIN, AFFECT_PIN,
     )
 
