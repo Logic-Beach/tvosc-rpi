@@ -52,7 +52,7 @@ MODES = [
     "Histogram",
     "Waveform",
     "Bass Harmonic Anchor",
-    "LongWaveform",
+    "Spectral Seismograph",
     "Recurrence",
     "Oscilloscope",
     "Polar",
@@ -109,8 +109,8 @@ _lp_zi = [np.zeros(1, dtype=np.float64) for _ in range(TRIG_LP_POLES)]
 _total = 0
 _period = 0.0
 
-# Long waveform: three scrolling frequency lanes with guard gaps and no AGC,
-# so silence and the natural energy difference stay visible. Low is below.
+# Spectral Seismograph: three rising frequency lanes with guard gaps and no
+# AGC, so silence and the natural energy difference stay visible. Bass is left.
 LONG_BANDS = ((30.0, 120.0), (180.0, 1800.0), (2500.0, 20000.0))
 LONG_HISTORY_SECONDS = 3.0
 LONG_ANALYSIS_SAMPLES = 4096
@@ -333,43 +333,43 @@ def _update_long_history() -> None:
     _long_last_total = total
 
 
-def tri_band_long_waveform(width: int, height: int) -> np.ndarray:
-    """Three-lane long waveform: highs top, mids middle, lows bottom."""
+def spectral_seismograph(width: int, height: int) -> np.ndarray:
+    """Three vertical histories: bass left, mids center, highs right."""
     _update_long_history()
-    w = max(2, int(width))
-    h = max(6, int(height))
+    w = max(6, int(width))
+    h = max(2, int(height))
     frame = np.zeros((h, w), dtype=np.uint8)
     history = _long_history_copy()
-    lane_h = h / 3.0
-    for divider in (int(round(lane_h)), int(round(2.0 * lane_h))):
-        if 0 <= divider < h:
-            frame[divider, :] = 36
     if history.shape[0] < 2:
         return frame
-    source_x = np.arange(history.shape[0], dtype=np.float32)
-    target_x = np.linspace(0.0, float(history.shape[0] - 1), w)
+    source_y = np.arange(history.shape[0], dtype=np.float32)
+    target_y = np.linspace(0.0, float(history.shape[0] - 1), h)
+    lane_w = w / 3.0
+    gutter = max(4, int(round(w * 0.015)))
     for band_i in range(len(LONG_BANDS)):
-        lane_i = 2 - band_i
-        row0 = int(round(lane_i * lane_h))
-        row1 = int(round((lane_i + 1) * lane_h)) - 1
-        center = 0.5 * (row0 + row1)
-        half = max(2.0, 0.5 * (row1 - row0) - 3.0)
-        frame[int(round(center)), :] = np.maximum(frame[int(round(center)), :], 28)
+        col0 = int(round(band_i * lane_w))
+        col1 = int(round((band_i + 1) * lane_w)) - 1
+        if band_i > 0:
+            col0 += gutter // 2
+        if band_i < len(LONG_BANDS) - 1:
+            col1 -= gutter - gutter // 2
+        center = 0.5 * (col0 + col1)
+        half = max(2.0, 0.5 * (col1 - col0) - 3.0)
         lo_src = history[:, band_i, 0]
         hi_src = history[:, band_i, 1]
-        lo = np.interp(target_x, source_x, lo_src)
-        hi = np.interp(target_x, source_x, hi_src)
-        top = np.clip(np.rint(center - hi * half), row0 + 2, row1 - 2).astype(np.int32)
-        bottom = np.clip(np.rint(center - lo * half), row0 + 2, row1 - 2).astype(np.int32)
-        a = np.minimum(top, bottom)
-        b = np.maximum(top, bottom)
-        rows = np.arange(row0, row1 + 1, dtype=np.int32)[:, None]
-        fill = (rows >= a[None, :]) & (rows <= b[None, :])
-        lane = frame[row0 : row1 + 1]
+        lo = np.interp(target_y, source_y, lo_src)
+        hi = np.interp(target_y, source_y, hi_src)
+        left = np.clip(np.rint(center + lo * half), col0 + 2, col1 - 2).astype(np.int32)
+        right = np.clip(np.rint(center + hi * half), col0 + 2, col1 - 2).astype(np.int32)
+        a = np.minimum(left, right)
+        b = np.maximum(left, right)
+        columns = np.arange(col0, col1 + 1, dtype=np.int32)[None, :]
+        fill = (columns >= a[:, None]) & (columns <= b[:, None])
+        lane = frame[:, col0 : col1 + 1]
         lane[fill] = np.maximum(lane[fill], 76)
-        columns = np.arange(w, dtype=np.int32)
-        frame[a, columns] = 255
-        frame[b, columns] = 255
+        rows = np.arange(h, dtype=np.int32)
+        frame[rows, a] = 255
+        frame[rows, b] = 255
     return frame
 
 
@@ -510,8 +510,8 @@ def render_frame(mode: str, block: np.ndarray, width: int, height: int) -> np.nd
             return smooth_scope(tail, w, h)
         case "Bass Harmonic Anchor":
             return smooth_scope(locked_window(), w, h)
-        case "LongWaveform":
-            return tri_band_long_waveform(w, h)
+        case "Spectral Seismograph":
+            return spectral_seismograph(w, h)
         case "Recurrence":
             return lsao.live_recurrence(block, CHANNEL, w, h, 0.15, 1)
         case "Oscilloscope":
