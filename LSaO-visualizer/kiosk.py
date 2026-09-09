@@ -51,7 +51,7 @@ MODES = [
     "SpecBalance",
     "Histogram",
     "Waveform",
-    "WaveformTrig",
+    "Bass Harmonic Anchor",
     "LongWaveform",
     "Recurrence",
     "Oscilloscope",
@@ -76,7 +76,7 @@ AFFECT_FIFO = Path.home() / ".local/state" / "lsao-next"
 BACKEND_FILE = Path.home() / ".config" / "lsao" / "backend"
 _fifo_fd: int | None = None
 
-# Triggered waveform: a real scope trigger over 30–150 Hz. The filtered signal
+# Bass Harmonic Anchor: a real scope trigger over 30–150 Hz. The filtered signal
 # only decides where a sweep starts; the displayed signal is always fresh,
 # unfiltered audio. A Schmitt-armed upward zero crossing is stable even when
 # the raw synth has large, moving harmonics.
@@ -108,6 +108,23 @@ _lp_a = np.array([1.0, _lp_alpha - 1.0], dtype=np.float64)
 _lp_zi = [np.zeros(1, dtype=np.float64) for _ in range(TRIG_LP_POLES)]
 _total = 0
 _period = 0.0
+
+# Long waveform: three scrolling frequency lanes with guard gaps and no AGC,
+# so silence and the natural energy difference stay visible. Low is below.
+LONG_BANDS = ((30.0, 120.0), (180.0, 1800.0), (2500.0, 20000.0))
+LONG_HISTORY_SECONDS = 3.0
+LONG_ANALYSIS_SAMPLES = 4096
+LONG_HISTORY_POINTS = max(32, int(round(LONG_HISTORY_SECONDS * FPS)))
+_long_window = np.blackman(LONG_ANALYSIS_SAMPLES).astype(np.float32)
+_long_freqs = np.fft.rfftfreq(LONG_ANALYSIS_SAMPLES, 1.0 / 48000.0)
+_long_masks = [
+    (np.greater_equal(_long_freqs, low) & np.less(_long_freqs, high))
+    for low, high in LONG_BANDS
+]
+_long_last_total = -1
+_long_history = np.zeros((LONG_HISTORY_POINTS, len(LONG_BANDS), 2), dtype=np.float32)
+_long_history_i = 0
+_long_history_filled = 0
 
 
 def request_next(*_args) -> None:
@@ -212,7 +229,7 @@ def prep_block(block: np.ndarray) -> np.ndarray:
 
 
 def push_audio(block: np.ndarray) -> None:
-    """Keep a rolling stereo ring for triggered waveform (and latest_block)."""
+    """Keep a rolling stereo ring for Bass Harmonic Anchor (and latest_block)."""
     global latest_block, _ring_i, _ring_filled, _lp_zi, _total
     b = stereo_block(np.asarray(block, dtype=np.float32))
     if b.size == 0:
@@ -220,7 +237,8 @@ def push_audio(block: np.ndarray) -> None:
     latest_block = b
     n = min(int(b.shape[0]), RING_SAMPLES)
     b = b[-n:]
-    y = np.mean(b, axis=1)
+    mono = np.mean(b, axis=1)
+    y = mono
     for k in range(TRIG_LP_POLES):
         y, _lp_zi[k] = lfilter(_lp_b, _lp_a, y, zi=_lp_zi[k])
     filt = np.asarray(y, dtype=np.float32)
@@ -280,6 +298,78 @@ def smooth_scope(stereo: np.ndarray, width: int, height: int) -> np.ndarray:
         lo, hi = (b2, a) if a > b2 else (a, b2)
         frame[lo : hi + 1, i] = 255
     frame[int(ys[-1]), w - 1] = 255
+    return frame
+
+
+def _long_history_copy() -> np.ndarray:
+    filled = int(_long_history_filled)
+    i = int(_long_history_i)
+    if filled <= 0:
+        return np.zeros((0, len(LONG_BANDS), 2), dtype=np.float32)
+    if filled < LONG_HISTORY_POINTS:
+        return _long_history[:filled].copy()
+    return np.concatenate((_long_history[i:], _long_history[:i])).copy()
+
+
+def _update_long_history() -> None:
+    """Append one FFT-derived band envelope point for the newest audio."""
+    global _long_last_total, _long_history_i, _long_history_filled
+    stereo, _unused, total = ring_tail(LONG_ANALYSIS_SAMPLES)
+    n = int(stereo.shape[0])
+    if n < LONG_ANALYSIS_SAMPLES or total == _long_last_total:
+        return
+    mono = np.mean(stereo, axis=1)
+    spectrum = np.fft.rfft(mono * _long_window)
+    power = np.square(np.abs(spectrum))
+    norm = max(float(np.sum(_long_window)), 1.0)
+    amplitudes = np.array(
+        [2.0 * np.sqrt(float(np.sum(power[mask]))) / norm for mask in _long_masks],
+        dtype=np.float32,
+    )
+    _long_history[_long_history_i, :, 0] = -amplitudes
+    _long_history[_long_history_i, :, 1] = amplitudes
+    _long_history_i = (_long_history_i + 1) % LONG_HISTORY_POINTS
+    _long_history_filled = min(LONG_HISTORY_POINTS, _long_history_filled + 1)
+    _long_last_total = total
+
+
+def tri_band_long_waveform(width: int, height: int) -> np.ndarray:
+    """Three-lane long waveform: highs top, mids middle, lows bottom."""
+    _update_long_history()
+    w = max(2, int(width))
+    h = max(6, int(height))
+    frame = np.zeros((h, w), dtype=np.uint8)
+    history = _long_history_copy()
+    lane_h = h / 3.0
+    for divider in (int(round(lane_h)), int(round(2.0 * lane_h))):
+        if 0 <= divider < h:
+            frame[divider, :] = 36
+    if history.shape[0] < 2:
+        return frame
+    source_x = np.arange(history.shape[0], dtype=np.float32)
+    target_x = np.linspace(0.0, float(history.shape[0] - 1), w)
+    for band_i in range(len(LONG_BANDS)):
+        lane_i = 2 - band_i
+        row0 = int(round(lane_i * lane_h))
+        row1 = int(round((lane_i + 1) * lane_h)) - 1
+        center = 0.5 * (row0 + row1)
+        half = max(2.0, 0.5 * (row1 - row0) - 3.0)
+        frame[int(round(center)), :] = np.maximum(frame[int(round(center)), :], 28)
+        lo_src = history[:, band_i, 0]
+        hi_src = history[:, band_i, 1]
+        lo = np.interp(target_x, source_x, lo_src)
+        hi = np.interp(target_x, source_x, hi_src)
+        top = np.clip(np.rint(center - hi * half), row0 + 2, row1 - 2).astype(np.int32)
+        bottom = np.clip(np.rint(center - lo * half), row0 + 2, row1 - 2).astype(np.int32)
+        a = np.minimum(top, bottom)
+        b = np.maximum(top, bottom)
+        rows = np.arange(row0, row1 + 1, dtype=np.int32)[:, None]
+        fill = (rows >= a[None, :]) & (rows <= b[None, :])
+        lane = frame[row0 : row1 + 1]
+        lane[fill] = np.maximum(lane[fill], 76)
+        columns = np.arange(w, dtype=np.int32)
+        frame[a, columns] = 255
+        frame[b, columns] = 255
     return frame
 
 
@@ -418,10 +508,10 @@ def render_frame(mode: str, block: np.ndarray, width: int, height: int) -> np.nd
             if tail.shape[0] < 8:
                 tail = block
             return smooth_scope(tail, w, h)
-        case "WaveformTrig":
+        case "Bass Harmonic Anchor":
             return smooth_scope(locked_window(), w, h)
         case "LongWaveform":
-            return lsao.live_waveform_long(block, CHANNEL, w, h, 1)
+            return tri_band_long_waveform(w, h)
         case "Recurrence":
             return lsao.live_recurrence(block, CHANNEL, w, h, 0.15, 1)
         case "Oscilloscope":
