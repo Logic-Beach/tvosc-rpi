@@ -54,6 +54,7 @@ MODES = [
     "Bass Harmonic Anchor",
     "Spectral Seismograph",
     "Recurrence",
+    "Bass-anchored recurrence plot",
     "Oscilloscope",
     "Polar",
     "PolarStereo",
@@ -108,6 +109,12 @@ _lp_a = np.array([1.0, _lp_alpha - 1.0], dtype=np.float64)
 _lp_zi = [np.zeros(1, dtype=np.float64) for _ in range(TRIG_LP_POLES)]
 _total = 0
 _period = 0.0
+
+# Bass-anchored recurrence: compare local three-sample states over the same
+# fresh two-cycle sweep used by Bass Harmonic Anchor.
+BASS_REC_EMBED_DIM = 3
+BASS_REC_DELAY_CYCLE = 0.125
+BASS_REC_THRESHOLD = 0.30
 
 # Spectral Seismograph: three rising frequency lanes with guard gaps and no
 # AGC, so silence and the natural energy difference stay visible. Bass is left.
@@ -486,6 +493,42 @@ def locked_window() -> np.ndarray:
     return stereo[i : i + window]
 
 
+def bass_anchored_recurrence(width: int, height: int) -> np.ndarray:
+    """Recurrence of local waveform shape over a phase-locked bass sweep."""
+    w = max(2, int(width))
+    h = max(2, int(height))
+    stereo = prep_block(locked_window())
+    if stereo.shape[0] < 8:
+        return np.zeros((h, w), dtype=bool)
+    mono = np.mean(stereo, axis=1)
+    base = max(w, h)
+    delay = max(
+        1,
+        int(round(base * BASS_REC_DELAY_CYCLE / max(TRIG_CYCLES, 1.0))),
+    )
+    state_points = base + (BASS_REC_EMBED_DIM - 1) * delay
+    source = np.arange(mono.size, dtype=np.float32)
+    target = np.linspace(0.0, float(mono.size - 1), state_points)
+    wave = np.interp(target, source, mono).astype(np.float32)
+    wave -= float(np.mean(wave))
+    scale = float(np.percentile(np.abs(wave), 90))
+    if scale < 1e-5:
+        return np.zeros((h, w), dtype=bool)
+    wave = np.clip(wave / scale, -3.0, 3.0)
+    states = np.column_stack(
+        [wave[k * delay : k * delay + base] for k in range(BASS_REC_EMBED_DIM)]
+    )
+    row_i = np.rint(np.linspace(0, base - 1, h)).astype(np.int32)
+    col_i = np.rint(np.linspace(0, base - 1, w)).astype(np.int32)
+    rows = states[row_i]
+    cols = states[col_i]
+    row_norm2 = np.einsum("ij,ij->i", rows, rows)
+    col_norm2 = np.einsum("ij,ij->i", cols, cols)
+    distance2 = row_norm2[:, None] + col_norm2[None, :] - 2.0 * (rows @ cols.T)
+    limit2 = BASS_REC_EMBED_DIM * BASS_REC_THRESHOLD**2
+    return distance2 < limit2
+
+
 def render_frame(mode: str, block: np.ndarray, width: int, height: int) -> np.ndarray:
     w, h = int(width), int(height)
     match mode:
@@ -514,6 +557,8 @@ def render_frame(mode: str, block: np.ndarray, width: int, height: int) -> np.nd
             return spectral_seismograph(w, h)
         case "Recurrence":
             return lsao.live_recurrence(block, CHANNEL, w, h, 0.15, 1)
+        case "Bass-anchored recurrence plot":
+            return bass_anchored_recurrence(w, h)
         case "Oscilloscope":
             return lsao.live_oscilloscope(block, w, h, 1, 1)
         case "Polar":

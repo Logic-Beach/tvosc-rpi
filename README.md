@@ -42,7 +42,8 @@ changes the active LSaO visualization.
 The audio trigger and the displayed audio are separate. For example, Bass
 Harmonic Anchor filters a hidden trigger signal but displays fresh, unfiltered
 audio. Spectral Seismograph analyzes three bands without automatic gain:
-30–120 Hz, 180–1800 Hz, and 2.5–20 kHz.
+30–120 Hz, 180–1800 Hz, and 2.5–20 kHz. Bass-anchored recurrence plot compares
+three-sample delay states over a fresh, phase-locked two-cycle bass sweep.
 
 ## Repository and installed paths
 
