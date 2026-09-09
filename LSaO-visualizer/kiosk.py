@@ -132,22 +132,26 @@ _bass_rec_lut = np.rint(
     )
 ).astype(np.uint8)
 
-# Spectral Seismograph: three rising frequency lanes with guard gaps and no
-# AGC, so silence and the natural energy difference stay visible. Bass is left.
-LONG_BANDS = ((30.0, 120.0), (180.0, 1800.0), (2500.0, 20000.0))
-LONG_HISTORY_SECONDS = 3.0
-LONG_ANALYSIS_SAMPLES = 4096
-LONG_HISTORY_POINTS = max(32, int(round(LONG_HISTORY_SECONDS * FPS)))
-_long_window = np.blackman(LONG_ANALYSIS_SAMPLES).astype(np.float32)
-_long_freqs = np.fft.rfftfreq(LONG_ANALYSIS_SAMPLES, 1.0 / 48000.0)
-_long_masks = [
-    (np.greater_equal(_long_freqs, low) & np.less(_long_freqs, high))
-    for low, high in LONG_BANDS
-]
-_long_last_total = -1
-_long_history = np.zeros((LONG_HISTORY_POINTS, len(LONG_BANDS), 2), dtype=np.float32)
-_long_history_i = 0
-_long_history_filled = 0
+# Spectral Seismograph: three live band-filtered waveform lanes with guard gaps
+# and no AGC. Every lane uses the same bass-derived trigger, keeping harmonics
+# aligned while fresh audio continues to replace every frame.
+LONG_BANDS = ((30.0, 180.0), (180.0, 1800.0), (2500.0, 20000.0))
+LONG_TRACE_GAIN = 1.75
+LONG_FILTER_POLES = (3, 2, 1)
+LONG_FILTER_PAD = 768
+_long_filter_coefficients = []
+for (_low_hz, _high_hz), _poles in zip(LONG_BANDS, LONG_FILTER_POLES):
+    _long_lp_alpha = float(1.0 - np.exp(-2.0 * np.pi * _high_hz / 48000.0))
+    _long_hp_alpha = float(np.exp(-2.0 * np.pi * _low_hz / 48000.0))
+    _long_filter_coefficients.append(
+        (
+            np.array([_long_hp_alpha, -_long_hp_alpha], dtype=np.float64),
+            np.array([1.0, -_long_hp_alpha], dtype=np.float64),
+            np.array([_long_lp_alpha], dtype=np.float64),
+            np.array([1.0, _long_lp_alpha - 1.0], dtype=np.float64),
+            _poles,
+        )
+    )
 
 # Stereo fractals use fixed input calibration, not AGC. Left and right RMS
 # envelopes independently alter equation coefficients.
@@ -453,49 +457,34 @@ def xy_oscilloscope_line(block: np.ndarray, width: int, height: int) -> np.ndarr
     return _polyline_frame(xs, ys, w, h)
 
 
-def _long_history_copy() -> np.ndarray:
-    filled = int(_long_history_filled)
-    i = int(_long_history_i)
-    if filled <= 0:
-        return np.zeros((0, len(LONG_BANDS), 2), dtype=np.float32)
-    if filled < LONG_HISTORY_POINTS:
-        return _long_history[:filled].copy()
-    return np.concatenate((_long_history[i:], _long_history[:i])).copy()
-
-
-def _update_long_history() -> None:
-    """Append one FFT-derived band envelope point for the newest audio."""
-    global _long_last_total, _long_history_i, _long_history_filled
-    stereo, _unused, total = ring_tail(LONG_ANALYSIS_SAMPLES)
-    n = int(stereo.shape[0])
-    if n < LONG_ANALYSIS_SAMPLES or total == _long_last_total:
-        return
-    mono = np.mean(stereo, axis=1)
-    spectrum = np.fft.rfft(mono * _long_window)
-    power = np.square(np.abs(spectrum))
-    norm = max(float(np.sum(_long_window)), 1.0)
-    amplitudes = np.array(
-        [2.0 * np.sqrt(float(np.sum(power[mask]))) / norm for mask in _long_masks],
-        dtype=np.float32,
+def _long_bandpass(wave: np.ndarray, band_i: int) -> np.ndarray:
+    """Apply a low-cost causal bandpass with reflected warm-up samples."""
+    if wave.size < 2:
+        return np.asarray(wave, dtype=np.float32)
+    pad = min(LONG_FILTER_PAD, int(wave.size) - 1)
+    filtered = np.pad(
+        np.asarray(wave, dtype=np.float64),
+        (pad, 0),
+        mode="reflect",
     )
-    _long_history[_long_history_i, :, 0] = -amplitudes
-    _long_history[_long_history_i, :, 1] = amplitudes
-    _long_history_i = (_long_history_i + 1) % LONG_HISTORY_POINTS
-    _long_history_filled = min(LONG_HISTORY_POINTS, _long_history_filled + 1)
-    _long_last_total = total
+    hp_b, hp_a, lp_b, lp_a, poles = _long_filter_coefficients[band_i]
+    filtered = lfilter(hp_b, hp_a, filtered)
+    for _ in range(poles):
+        filtered = lfilter(lp_b, lp_a, filtered)
+    return np.asarray(filtered[pad:], dtype=np.float32)
 
 
 def spectral_seismograph(width: int, height: int) -> np.ndarray:
-    """Three vertical histories: bass left, mids center, highs right."""
-    _update_long_history()
+    """Three vertical waveforms sharing Bass Harmonic Anchor's trigger."""
     w = max(6, int(width))
     h = max(2, int(height))
     frame = np.zeros((h, w), dtype=np.uint8)
-    history = _long_history_copy()
-    if history.shape[0] < 2:
+    sweep = prep_block(locked_window())
+    if sweep.shape[0] < 2:
         return frame
-    source_y = np.arange(history.shape[0], dtype=np.float32)
-    target_y = np.linspace(0.0, float(history.shape[0] - 1), h)
+    mono = np.mean(sweep, axis=1)
+    source_y = np.arange(mono.size, dtype=np.float32)
+    target_y = np.linspace(0.0, float(mono.size - 1), h)
     lane_w = w / 3.0
     gutter = max(4, int(round(w * 0.015)))
     for band_i in range(len(LONG_BANDS)):
@@ -507,21 +496,20 @@ def spectral_seismograph(width: int, height: int) -> np.ndarray:
             col1 -= gutter - gutter // 2
         center = 0.5 * (col0 + col1)
         half = max(2.0, 0.5 * (col1 - col0) - 3.0)
-        lo_src = history[:, band_i, 0]
-        hi_src = history[:, band_i, 1]
-        lo = np.interp(target_y, source_y, lo_src)
-        hi = np.interp(target_y, source_y, hi_src)
-        left = np.clip(np.rint(center + lo * half), col0 + 2, col1 - 2).astype(np.int32)
-        right = np.clip(np.rint(center + hi * half), col0 + 2, col1 - 2).astype(np.int32)
-        a = np.minimum(left, right)
-        b = np.maximum(left, right)
+        band = _long_bandpass(mono, band_i)
+        trace = np.interp(target_y, source_y, band) * LONG_TRACE_GAIN
+        x = np.clip(
+            np.rint(center + trace * half),
+            col0 + 2,
+            col1 - 2,
+        ).astype(np.int32)
+        lo = np.minimum(x[:-1], x[1:])
+        hi = np.maximum(x[:-1], x[1:])
         columns = np.arange(col0, col1 + 1, dtype=np.int32)[None, :]
-        fill = (columns >= a[:, None]) & (columns <= b[:, None])
-        lane = frame[:, col0 : col1 + 1]
-        lane[fill] = np.maximum(lane[fill], 76)
-        rows = np.arange(h, dtype=np.int32)
-        frame[rows, a] = 255
-        frame[rows, b] = 255
+        connected = (columns >= lo[:, None]) & (columns <= hi[:, None])
+        lane = frame[: h - 1, col0 : col1 + 1]
+        lane[connected] = 255
+        frame[h - 1, int(x[-1])] = 255
     return frame
 
 
