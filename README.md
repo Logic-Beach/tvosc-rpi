@@ -49,8 +49,12 @@ three-sample delay states over a fresh, phase-locked two-cycle bass sweep and
 maps state similarity continuously from white through gray to black. A noise
 gate keeps silence black; musical input above it is normalized for visibility.
 Strange Attractor draws a conventional De Jong orbit. Separate left/right
-broadband levels provide its main evolution, while 30–150 Hz energy adds phase
+broadband levels provide its main evolution, while 30–180 Hz energy adds phase
 acceleration and brightness. Short trails join successive shapes.
+Starfield Zoom projects a deterministic pool of stars toward the viewer:
+full-band volume onsets spawn bursts from deep near the vanishing point and
+create short forward warp pulses. High-frequency energy enlarges and brightens
+stars, and stereo balance moves the vanishing point.
 
 ## Repository and installed paths
 

@@ -62,6 +62,7 @@ MODES = [
     "Poincare",
     "DelayEmbed",
     "Strange Attractor",
+    "Starfield Zoom",
    #"Chladni",
    # "Envelope",
 ]
@@ -161,7 +162,7 @@ FRACTAL_RELEASE_S = 0.045
 FRACTAL_UPDATE_S = 1.0 / 24.0
 FRACTAL_BASS_SAMPLES = 2048
 FRACTAL_BASS_LOW_HZ = 30.0
-FRACTAL_BASS_HIGH_HZ = 150.0
+FRACTAL_BASS_HIGH_HZ = 180.0
 FRACTAL_BASS_LP_POLES = 2
 _fractal_bass_lp_alpha = float(
     1.0 - np.exp(-2.0 * np.pi * FRACTAL_BASS_HIGH_HZ / 48000.0)
@@ -201,6 +202,30 @@ _attractor_frame_time = 0.0
 _attractor_phase = np.zeros(2, dtype=np.float64)
 _attractor_coefficients = np.array([1.40, -2.30, 2.40, -2.10])
 _attractor_trail = np.zeros((ATTRACTOR_SIZE, ATTRACTOR_SIZE), dtype=np.float32)
+
+STARFIELD_MAX_STARS = 480
+STARFIELD_MIN_STARS = 72
+STARFIELD_NEAR_Z = 0.08
+STARFIELD_FAR_Z = 4.8
+STARFIELD_SPEED = 0.72
+STARFIELD_HIGH_FULL = 0.04
+_starfield_rng = np.random.default_rng(1983)
+_starfield_x = _starfield_rng.uniform(-1.25, 1.25, STARFIELD_MAX_STARS)
+_starfield_y = _starfield_rng.uniform(-1.25, 1.25, STARFIELD_MAX_STARS)
+_starfield_z = _starfield_rng.uniform(
+    STARFIELD_NEAR_Z,
+    STARFIELD_FAR_Z,
+    STARFIELD_MAX_STARS,
+)
+_starfield_active = np.zeros(STARFIELD_MAX_STARS, dtype=bool)
+_starfield_active[:STARFIELD_MIN_STARS] = True
+_starfield_volume = 0.0
+_starfield_kick = 0.0
+_starfield_high = 0.0
+_starfield_pan = 0.0
+_starfield_warp = 0.0
+_starfield_spawn_credit = 0.0
+_starfield_time = 0.0
 
 
 def request_next(*_args) -> None:
@@ -839,6 +864,174 @@ def strange_attractor(block: np.ndarray) -> np.ndarray:
     return _attractor_frame
 
 
+def _starfield_levels(
+    block: np.ndarray,
+    dt: float,
+) -> tuple[float, float, float]:
+    """Return volume onset, high energy, and stereo balance."""
+    global _starfield_volume, _starfield_kick, _starfield_high
+    global _starfield_pan
+    stereo = prep_block(block)
+    mono = np.mean(stereo, axis=1) if stereo.size else np.zeros(0, dtype=np.float32)
+    high = _long_bandpass(mono, 2)
+    high_level = float(np.sqrt(np.mean(np.square(high)))) if high.size else 0.0
+    volume_level = (
+        float(np.sqrt(np.mean(np.square(stereo[:, :2])))) if stereo.size else 0.0
+    )
+    if stereo.size:
+        channel_rms = np.sqrt(np.mean(np.square(stereo[:, :2]), axis=0))
+        pan_target = float(
+            np.clip(
+                (channel_rms[1] - channel_rms[0])
+                / max(float(channel_rms[0] + channel_rms[1]), 1e-5),
+                -1.0,
+                1.0,
+            )
+        )
+    else:
+        pan_target = 0.0
+    volume_target = float(np.clip(volume_level, 0.0, 1.0))
+    high_target = float(np.clip(high_level / STARFIELD_HIGH_FULL, 0.0, 1.0))
+    volume_tau = 0.015 if volume_target > _starfield_volume else 0.12
+    high_tau = 0.012 if high_target > _starfield_high else 0.08
+    previous_volume = _starfield_volume
+    _starfield_volume += (volume_target - _starfield_volume) * (
+        1.0 - math.exp(-dt / volume_tau)
+    )
+    _starfield_kick = max(0.0, _starfield_volume - previous_volume)
+    _starfield_high += (high_target - _starfield_high) * (
+        1.0 - math.exp(-dt / high_tau)
+    )
+    _starfield_pan += (pan_target - _starfield_pan) * (
+        1.0 - math.exp(-dt / 0.10)
+    )
+    return _starfield_kick, _starfield_high, _starfield_pan
+
+
+def starfield_zoom(block: np.ndarray, width: int, height: int) -> np.ndarray:
+    """Deep perspective field: volume onsets spawn, highs brighten and enlarge."""
+    global _starfield_time, _starfield_warp
+    global _starfield_spawn_credit
+    w = max(2, int(width))
+    h = max(2, int(height))
+    now = time.monotonic()
+    dt = (
+        1.0 / max(FPS, 1)
+        if _starfield_time <= 0.0
+        else float(np.clip(now - _starfield_time, 0.001, 0.05))
+    )
+    _starfield_time = now
+    kick, high, pan = _starfield_levels(block, dt)
+    _starfield_warp *= math.exp(-dt / 0.13)
+    _starfield_warp = max(_starfield_warp, min(0.65, 4.0 * kick))
+
+    old_z = _starfield_z.copy()
+    active_i = np.flatnonzero(_starfield_active)
+    _starfield_z[active_i] -= (
+        STARFIELD_SPEED
+        * (1.0 + 1.20 * _starfield_volume + 0.75 * _starfield_warp)
+        * dt
+    )
+    projection = 0.52 * min(w, h) * (1.0 + 0.25 * _starfield_warp)
+    center_x = 0.5 * (w - 1) + 0.18 * w * pan
+    center_y = 0.5 * (h - 1)
+    world_x = _starfield_x
+    world_y = _starfield_y
+    if active_i.size:
+        active_px = center_x + projection * world_x[active_i] / _starfield_z[
+            active_i
+        ]
+        active_py = center_y + projection * world_y[active_i] / _starfield_z[
+            active_i
+        ]
+        expired = (
+            (_starfield_z[active_i] <= STARFIELD_NEAR_Z)
+            | (active_px < 0.0)
+            | (active_px >= w)
+            | (active_py < 0.0)
+            | (active_py >= h)
+        )
+        _starfield_active[active_i[expired]] = False
+
+    active_count = int(np.count_nonzero(_starfield_active))
+    _starfield_spawn_credit += kick * 90.0
+    burst = int(_starfield_spawn_credit)
+    _starfield_spawn_credit -= burst
+    spawn_count = burst + max(0, STARFIELD_MIN_STARS - active_count)
+    available = np.flatnonzero(~_starfield_active)
+    spawn_i = available[:spawn_count]
+    if spawn_i.size:
+        _starfield_x[spawn_i] = _starfield_rng.uniform(-1.25, 1.25, spawn_i.size)
+        _starfield_y[spawn_i] = _starfield_rng.uniform(-1.25, 1.25, spawn_i.size)
+        _starfield_z[spawn_i] = _starfield_rng.uniform(
+            3.2,
+            STARFIELD_FAR_Z,
+            spawn_i.size,
+        )
+        old_z[spawn_i] = _starfield_z[spawn_i]
+        _starfield_active[spawn_i] = True
+
+    active_i = np.flatnonzero(_starfield_active)
+    current_z = _starfield_z[active_i]
+    px = center_x + projection * world_x[active_i] / current_z
+    py = center_y + projection * world_y[active_i] / current_z
+    x1 = np.rint(px).astype(np.int32)
+    y1 = np.rint(py).astype(np.int32)
+    x0 = np.rint(
+        center_x + projection * world_x[active_i] / old_z[active_i]
+    ).astype(np.int32)
+    y0 = np.rint(
+        center_y + projection * world_y[active_i] / old_z[active_i]
+    ).astype(np.int32)
+    depth = np.clip(
+        (STARFIELD_FAR_Z - current_z) / (STARFIELD_FAR_Z - STARFIELD_NEAR_Z),
+        0.0,
+        1.0,
+    )
+    brightness = np.rint(
+        (24.0 + 231.0 * high) * (0.20 + 0.80 * np.power(depth, 0.55))
+    ).astype(np.uint8)
+
+    dx = x1 - x0
+    dy = y1 - y0
+    steps = np.maximum(np.maximum(np.abs(dx), np.abs(dy)), 1)
+    max_steps = int(np.max(steps))
+    k = np.arange(max_steps + 1, dtype=np.float32)[None, :]
+    valid = k <= steps[:, None]
+    line_x = np.rint(x0[:, None] + dx[:, None] * k / steps[:, None]).astype(
+        np.int32
+    )
+    line_y = np.rint(y0[:, None] + dy[:, None] * k / steps[:, None]).astype(
+        np.int32
+    )
+    line_x = np.clip(line_x, 0, w - 1)
+    line_y = np.clip(line_y, 0, h - 1)
+    values = np.broadcast_to(brightness[:, None], line_x.shape)
+    frame = np.zeros((h, w), dtype=np.uint8)
+    np.maximum.at(frame, (line_y[valid], line_x[valid]), values[valid])
+
+    size_score = depth + high
+    medium = size_score >= 0.58
+    for offset_y, offset_x in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+        nx = np.clip(x1[medium] + offset_x, 0, w - 1)
+        ny = np.clip(y1[medium] + offset_y, 0, h - 1)
+        np.maximum.at(
+            frame,
+            (ny, nx),
+            (brightness[medium] * 0.72).astype(np.uint8),
+        )
+    large = size_score >= 1.12
+    for offset_y, offset_x in ((-1, -1), (-1, 1), (1, -1), (1, 1)):
+        nx = np.clip(x1[large] + offset_x, 0, w - 1)
+        ny = np.clip(y1[large] + offset_y, 0, h - 1)
+        np.maximum.at(
+            frame,
+            (ny, nx),
+            (brightness[large] * 0.52).astype(np.uint8),
+        )
+    return frame
+
+
 def render_frame(mode: str, block: np.ndarray, width: int, height: int) -> np.ndarray:
     w, h = int(width), int(height)
     match mode:
@@ -881,6 +1074,8 @@ def render_frame(mode: str, block: np.ndarray, width: int, height: int) -> np.nd
             return lsao.live_delay_embed(block, STEREO, w, h, 10, 20, 0, 0.25, 1, 1)
         case "Strange Attractor":
             return strange_attractor(block)
+        case "Starfield Zoom":
+            return starfield_zoom(block, w, h)
         case "Envelope":
             return lsao.live_envelope(block, CHANNEL, w, h, 1, "Filled Envelope", 1)
         case "Chladni":
@@ -1183,6 +1378,15 @@ class Kiosk:
                     f" env={_fractal_levels[0]:.2f}/{_fractal_levels[1]:.2f}"
                     f" bass={_fractal_bass_levels[0]:.3f}/"
                     f"{_fractal_bass_levels[1]:.3f}"
+                )
+            elif mode == "Starfield Zoom":
+                fractal_status = (
+                    f" stars={np.count_nonzero(_starfield_active)}"
+                    f" volume={_starfield_volume:.2f}"
+                    f" kick={_starfield_kick:.3f}"
+                    f" high={_starfield_high:.2f}"
+                    f" pan={_starfield_pan:.2f}"
+                    f" warp={_starfield_warp:.2f}"
                 )
             print(
                 f"lsao fps={self._fps_n / elapsed:.1f} "
