@@ -8,6 +8,7 @@ window instead. SIGUSR2 cycles visualizer types.
 
 from __future__ import annotations
 
+import math
 import os
 import signal
 import subprocess
@@ -46,26 +47,27 @@ SPECTRUM_XHIGH = 2000
 INTERNAL = 300
 CHLADNI_PLATE = "Cosine"
 MODES = [
-    "Spectrum",
-    "SpectrumdB",
-    "SpecBalance",
-    "Histogram",
-    "Waveform",
+    #"Spectrum",
+    #"SpectrumdB",
+   # "SpecBalance",
+   # "Histogram",
+   # "Waveform",
     "Bass Harmonic Anchor",
     "Spectral Seismograph",
-    "Recurrence",
+   # "Recurrence",
     "Bass-anchored recurrence plot",
     "Oscilloscope",
-    "Polar",
+    #"Polar",
     "PolarStereo",
     "Poincare",
     "DelayEmbed",
-    "Chladni",
-    "Envelope",
+    "Strange Attractor",
+   #"Chladni",
+   # "Envelope",
 ]
 RENDER_SIZE = {name: (INTERNAL, INTERNAL) for name in MODES}
 MIN_DIM = INTERNAL
-DEFAULT_MODE = "Waveform"  # Short Waveform
+DEFAULT_MODE = "Bass Harmonic Anchor"
 
 pending_next = False
 pending_prev = False
@@ -114,7 +116,21 @@ _period = 0.0
 # fresh two-cycle sweep used by Bass Harmonic Anchor.
 BASS_REC_EMBED_DIM = 3
 BASS_REC_DELAY_CYCLE = 0.125
-BASS_REC_THRESHOLD = 0.30
+BASS_REC_SIGMA = 0.30
+BASS_REC_SILENCE = 0.003
+BASS_REC_FULL_LEVEL = 0.040
+BASS_REC_SIZE = 220
+BASS_REC_LUT_SIZE = 2048
+_bass_rec_spread2 = BASS_REC_EMBED_DIM * BASS_REC_SIGMA**2
+_bass_rec_max_distance2 = 16.0 * _bass_rec_spread2
+_bass_rec_lut_scale = (BASS_REC_LUT_SIZE - 1) / _bass_rec_max_distance2
+_bass_rec_lut = np.rint(
+    255.0
+    * np.exp(
+        -np.linspace(0.0, _bass_rec_max_distance2, BASS_REC_LUT_SIZE)
+        / (2.0 * _bass_rec_spread2)
+    )
+).astype(np.uint8)
 
 # Spectral Seismograph: three rising frequency lanes with guard gaps and no
 # AGC, so silence and the natural energy difference stay visible. Bass is left.
@@ -132,6 +148,55 @@ _long_last_total = -1
 _long_history = np.zeros((LONG_HISTORY_POINTS, len(LONG_BANDS), 2), dtype=np.float32)
 _long_history_i = 0
 _long_history_filled = 0
+
+# Stereo fractals use fixed input calibration, not AGC. Left and right RMS
+# envelopes independently alter equation coefficients.
+FRACTAL_GATE = 0.0015
+FRACTAL_ATTACK_S = 0.010
+FRACTAL_RELEASE_S = 0.045
+FRACTAL_UPDATE_S = 1.0 / 24.0
+FRACTAL_BASS_SAMPLES = 2048
+FRACTAL_BASS_LOW_HZ = 30.0
+FRACTAL_BASS_HIGH_HZ = 150.0
+FRACTAL_BASS_LP_POLES = 2
+_fractal_bass_lp_alpha = float(
+    1.0 - np.exp(-2.0 * np.pi * FRACTAL_BASS_HIGH_HZ / 48000.0)
+)
+_fractal_bass_lp_b = np.array([_fractal_bass_lp_alpha], dtype=np.float64)
+_fractal_bass_lp_a = np.array(
+    [1.0, _fractal_bass_lp_alpha - 1.0],
+    dtype=np.float64,
+)
+_fractal_bass_hp_alpha = float(
+    np.exp(-2.0 * np.pi * FRACTAL_BASS_LOW_HZ / 48000.0)
+)
+_fractal_bass_hp_b = np.array(
+    [_fractal_bass_hp_alpha, -_fractal_bass_hp_alpha],
+    dtype=np.float64,
+)
+_fractal_bass_hp_a = np.array(
+    [1.0, -_fractal_bass_hp_alpha],
+    dtype=np.float64,
+)
+_fractal_bass_lp_zi = [
+    np.zeros((1, 2), dtype=np.float64) for _ in range(FRACTAL_BASS_LP_POLES)
+]
+_fractal_bass_hp_zi = np.zeros((1, 2), dtype=np.float64)
+_fractal_bass_ring = np.zeros((RING_SAMPLES, 2), dtype=np.float32)
+_fractal_input_rms = np.zeros(2, dtype=np.float32)
+_fractal_levels = np.zeros(2, dtype=np.float32)
+_fractal_bass_input = np.zeros(2, dtype=np.float32)
+_fractal_bass_levels = np.zeros(2, dtype=np.float32)
+_fractal_level_time = 0.0
+
+ATTRACTOR_SIZE = 112
+ATTRACTOR_POINTS = 1400
+ATTRACTOR_BURN_IN = 60
+_attractor_frame = np.zeros((ATTRACTOR_SIZE, ATTRACTOR_SIZE), dtype=np.uint8)
+_attractor_frame_time = 0.0
+_attractor_phase = np.zeros(2, dtype=np.float64)
+_attractor_coefficients = np.array([1.40, -2.30, 2.40, -2.10])
+_attractor_trail = np.zeros((ATTRACTOR_SIZE, ATTRACTOR_SIZE), dtype=np.float32)
 
 
 def request_next(*_args) -> None:
@@ -238,6 +303,7 @@ def prep_block(block: np.ndarray) -> np.ndarray:
 def push_audio(block: np.ndarray) -> None:
     """Keep a rolling stereo ring for Bass Harmonic Anchor (and latest_block)."""
     global latest_block, _ring_i, _ring_filled, _lp_zi, _total
+    global _fractal_bass_lp_zi, _fractal_bass_hp_zi
     b = stereo_block(np.asarray(block, dtype=np.float32))
     if b.size == 0:
         return
@@ -249,18 +315,55 @@ def push_audio(block: np.ndarray) -> None:
     for k in range(TRIG_LP_POLES):
         y, _lp_zi[k] = lfilter(_lp_b, _lp_a, y, zi=_lp_zi[k])
     filt = np.asarray(y, dtype=np.float32)
+    bass = b
+    for k in range(FRACTAL_BASS_LP_POLES):
+        bass, _fractal_bass_lp_zi[k] = lfilter(
+            _fractal_bass_lp_b,
+            _fractal_bass_lp_a,
+            bass,
+            axis=0,
+            zi=_fractal_bass_lp_zi[k],
+        )
+    bass, _fractal_bass_hp_zi = lfilter(
+        _fractal_bass_hp_b,
+        _fractal_bass_hp_a,
+        bass,
+        axis=0,
+        zi=_fractal_bass_hp_zi,
+    )
+    bass = np.asarray(bass, dtype=np.float32)
     with _ring_lock:
         i = _ring_i
         first = min(n, RING_SAMPLES - i)
         _ring[i : i + first] = b[:first]
         _lp[i : i + first] = filt[:first]
+        _fractal_bass_ring[i : i + first] = bass[:first]
         rest = n - first
         if rest:
             _ring[0:rest] = b[first:]
             _lp[0:rest] = filt[first:]
+            _fractal_bass_ring[0:rest] = bass[first:]
         _ring_i = (i + n) % RING_SAMPLES
         _ring_filled = min(RING_SAMPLES, _ring_filled + n)
         _total += n
+
+
+def fractal_bass_tail(count: int) -> np.ndarray:
+    """Copy the newest stereo 30–150 Hz samples from the filter ring."""
+    with _ring_lock:
+        n = _ring_filled
+        take = min(int(n), int(count))
+        if take <= 0:
+            return np.zeros((0, 2), dtype=np.float32)
+        i = _ring_i
+        if n < RING_SAMPLES:
+            return _fractal_bass_ring[n - take : n].copy()
+        start = (i - take) % RING_SAMPLES
+        if start < i:
+            return _fractal_bass_ring[start:i].copy()
+        return np.concatenate(
+            [_fractal_bass_ring[start:], _fractal_bass_ring[:i]]
+        )
 
 
 def ring_tail(count: int) -> tuple[np.ndarray, np.ndarray, int]:
@@ -306,6 +409,48 @@ def smooth_scope(stereo: np.ndarray, width: int, height: int) -> np.ndarray:
         frame[lo : hi + 1, i] = 255
     frame[int(ys[-1]), w - 1] = 255
     return frame
+
+
+def _polyline_frame(
+    xs: np.ndarray,
+    ys: np.ndarray,
+    width: int,
+    height: int,
+) -> np.ndarray:
+    """Rasterize an ordered series of points as gap-free DDA segments."""
+    w = max(2, int(width))
+    h = max(2, int(height))
+    xs = np.clip(np.asarray(xs, dtype=np.int32), 0, w - 1)
+    ys = np.clip(np.asarray(ys, dtype=np.int32), 0, h - 1)
+    if xs.size < 2 or ys.size < 2:
+        return np.zeros((h, w), dtype=np.uint8)
+    dx = np.diff(xs)
+    dy = np.diff(ys)
+    steps = np.maximum(np.abs(dx), np.abs(dy))
+    max_steps = int(np.max(steps))
+    frame = np.zeros((h, w), dtype=np.uint8)
+    if max_steps <= 0:
+        frame[int(ys[0]), int(xs[0])] = 255
+        return frame
+    k = np.arange(max_steps + 1, dtype=np.float32)[None, :]
+    count = np.maximum(steps, 1)[:, None]
+    valid = k <= steps[:, None]
+    line_x = np.rint(xs[:-1, None] + dx[:, None] * k / count).astype(np.int32)
+    line_y = np.rint(ys[:-1, None] + dy[:, None] * k / count).astype(np.int32)
+    frame[line_y[valid], line_x[valid]] = 255
+    return frame
+
+
+def xy_oscilloscope_line(block: np.ndarray, width: int, height: int) -> np.ndarray:
+    """Connect successive stereo XY samples with continuous segments."""
+    w = max(2, int(width))
+    h = max(2, int(height))
+    stereo = prep_block(block)
+    if stereo.shape[0] < 2:
+        return np.zeros((h, w), dtype=np.uint8)
+    ys = np.rint((stereo[:, 0] + 1.0) * (h - 1) * 0.5)
+    xs = np.rint((-stereo[:, 1] + 1.0) * (w - 1) * 0.5)
+    return _polyline_frame(xs, ys, w, h)
 
 
 def _long_history_copy() -> np.ndarray:
@@ -494,12 +639,12 @@ def locked_window() -> np.ndarray:
 
 
 def bass_anchored_recurrence(width: int, height: int) -> np.ndarray:
-    """Recurrence of local waveform shape over a phase-locked bass sweep."""
-    w = max(2, int(width))
-    h = max(2, int(height))
+    """Weighted recurrence of local shape over a phase-locked bass sweep."""
+    w = max(2, min(int(width), BASS_REC_SIZE))
+    h = max(2, min(int(height), BASS_REC_SIZE))
     stereo = prep_block(locked_window())
     if stereo.shape[0] < 8:
-        return np.zeros((h, w), dtype=bool)
+        return np.zeros((h, w), dtype=np.uint8)
     mono = np.mean(stereo, axis=1)
     base = max(w, h)
     delay = max(
@@ -511,10 +656,17 @@ def bass_anchored_recurrence(width: int, height: int) -> np.ndarray:
     target = np.linspace(0.0, float(mono.size - 1), state_points)
     wave = np.interp(target, source, mono).astype(np.float32)
     wave -= float(np.mean(wave))
-    scale = float(np.percentile(np.abs(wave), 90))
-    if scale < 1e-5:
-        return np.zeros((h, w), dtype=bool)
-    wave = np.clip(wave / scale, -3.0, 3.0)
+    level = float(np.percentile(np.abs(wave), 90))
+    if level < BASS_REC_SILENCE:
+        return np.zeros((h, w), dtype=np.uint8)
+    activity = float(
+        np.clip(
+            (level - BASS_REC_SILENCE) / (BASS_REC_FULL_LEVEL - BASS_REC_SILENCE),
+            0.0,
+            1.0,
+        )
+    )
+    wave = np.clip(wave / level, -3.0, 3.0)
     states = np.column_stack(
         [wave[k * delay : k * delay + base] for k in range(BASS_REC_EMBED_DIM)]
     )
@@ -525,8 +677,178 @@ def bass_anchored_recurrence(width: int, height: int) -> np.ndarray:
     row_norm2 = np.einsum("ij,ij->i", rows, rows)
     col_norm2 = np.einsum("ij,ij->i", cols, cols)
     distance2 = row_norm2[:, None] + col_norm2[None, :] - 2.0 * (rows @ cols.T)
-    limit2 = BASS_REC_EMBED_DIM * BASS_REC_THRESHOLD**2
-    return distance2 < limit2
+    distance2 = np.maximum(distance2, 0.0)
+    lut_i = np.clip(
+        np.rint(distance2 * _bass_rec_lut_scale),
+        0,
+        BASS_REC_LUT_SIZE - 1,
+    ).astype(np.int32)
+    brightness = _bass_rec_lut[lut_i].astype(np.float32) * activity
+    return np.rint(brightness).astype(np.uint8)
+
+
+def _stereo_fractal_levels(
+    block: np.ndarray,
+) -> tuple[float, float, float, float]:
+    """Return smoothed broadband and 30–150 Hz levels for both channels."""
+    global _fractal_level_time
+    stereo = prep_block(block)
+    if stereo.size:
+        rms = np.sqrt(np.mean(np.square(stereo[:, :2]), axis=0))
+        _fractal_input_rms[:] = rms
+        activity = np.maximum(rms - FRACTAL_GATE, 0.0)
+        target = np.clip(activity, 0.0, 1.0)
+    else:
+        _fractal_input_rms[:] = 0.0
+        target = np.zeros(2, dtype=np.float32)
+
+    bass_stereo = fractal_bass_tail(FRACTAL_BASS_SAMPLES)
+    if bass_stereo.shape[0] < 64:
+        bass_stereo = stereo
+        for _ in range(FRACTAL_BASS_LP_POLES):
+            bass_stereo = lfilter(
+                _fractal_bass_lp_b,
+                _fractal_bass_lp_a,
+                bass_stereo,
+                axis=0,
+            )
+        bass_stereo = lfilter(
+            _fractal_bass_hp_b,
+            _fractal_bass_hp_a,
+            bass_stereo,
+            axis=0,
+        )
+    n = int(bass_stereo.shape[0])
+    if n >= 64:
+        centered = bass_stereo - np.mean(bass_stereo, axis=0, keepdims=True)
+        bass_rms = np.sqrt(np.mean(np.square(centered), axis=0))
+        _fractal_bass_input[:] = bass_rms
+        bass_target = np.clip(
+            np.maximum(bass_rms - FRACTAL_GATE, 0.0),
+            0.0,
+            1.0,
+        )
+    else:
+        _fractal_bass_input[:] = 0.0
+        bass_target = np.zeros(2, dtype=np.float32)
+
+    now = time.monotonic()
+    if _fractal_level_time <= 0.0:
+        dt = 1.0 / max(FPS, 1)
+    else:
+        dt = float(np.clip(now - _fractal_level_time, 0.001, 0.1))
+    _fractal_level_time = now
+    tau = np.where(
+        target > _fractal_levels,
+        FRACTAL_ATTACK_S,
+        FRACTAL_RELEASE_S,
+    )
+    blend = 1.0 - np.exp(-dt / tau)
+    _fractal_levels[:] += (target - _fractal_levels) * blend
+    bass_tau = np.where(
+        bass_target > _fractal_bass_levels,
+        FRACTAL_ATTACK_S,
+        0.080,
+    )
+    bass_blend = 1.0 - np.exp(-dt / bass_tau)
+    _fractal_bass_levels[:] += (
+        bass_target - _fractal_bass_levels
+    ) * bass_blend
+    return (
+        float(_fractal_levels[0]),
+        float(_fractal_levels[1]),
+        float(_fractal_bass_levels[0]),
+        float(_fractal_bass_levels[1]),
+    )
+
+
+def strange_attractor(block: np.ndarray) -> np.ndarray:
+    """De Jong orbit whose parameter phases advance from stereo levels."""
+    global _attractor_frame, _attractor_frame_time
+    now = time.monotonic()
+    if (
+        _attractor_frame_time > 0.0
+        and now - _attractor_frame_time < FRACTAL_UPDATE_S
+    ):
+        return _attractor_frame
+    left, right, bass_left, bass_right = _stereo_fractal_levels(block)
+    dt = (
+        FRACTAL_UPDATE_S
+        if _attractor_frame_time <= 0.0
+        else float(np.clip(now - _attractor_frame_time, 0.001, 0.1))
+    )
+    _attractor_frame_time = now
+    phase_velocity = (
+        0.08
+        + 2.20 * np.array((left, right))
+        + 5.50 * np.array((bass_left, bass_right))
+    )
+    _attractor_phase[:] = np.mod(
+        _attractor_phase + dt * phase_velocity,
+        2.0 * np.pi,
+    )
+    phase_l, phase_r = _attractor_phase
+    coefficient_target = np.array(
+        [
+            1.40 + 0.24 * math.sin(phase_l),
+            -2.30 + 0.24 * math.sin(phase_r),
+            2.40,
+            -2.10,
+        ],
+        dtype=np.float64,
+    )
+    coefficient_blend = 1.0 - math.exp(-dt / 0.18)
+    _attractor_coefficients[:] += (
+        coefficient_target - _attractor_coefficients
+    ) * coefficient_blend
+    a, b, c, d = _attractor_coefficients
+
+    xs = np.empty(ATTRACTOR_POINTS, dtype=np.float32)
+    ys = np.empty(ATTRACTOR_POINTS, dtype=np.float32)
+    x = 0.1
+    y = 0.1
+    out_i = 0
+    for iteration in range(ATTRACTOR_BURN_IN + ATTRACTOR_POINTS):
+        next_x = math.sin(a * y) - math.cos(b * x)
+        next_y = math.sin(c * x) - math.cos(d * y)
+        x, y = next_x, next_y
+        if iteration >= ATTRACTOR_BURN_IN:
+            xs[out_i] = x
+            ys[out_i] = y
+            out_i += 1
+
+    view_angle = (
+        0.12 * math.sin(0.37 * phase_l + 0.29 * phase_r)
+        + 0.18 * (right - left)
+        + 0.24 * (bass_right - bass_left)
+    )
+    cos_view = math.cos(view_angle)
+    sin_view = math.sin(view_angle)
+    scale_x = 0.72 + 0.18 * math.sqrt(left) + 0.24 * math.sqrt(bass_left)
+    scale_y = 0.72 + 0.18 * math.sqrt(right) + 0.24 * math.sqrt(bass_right)
+    view_x = scale_x * (cos_view * xs - sin_view * ys)
+    view_y = scale_y * (sin_view * xs + cos_view * ys)
+    scale = (ATTRACTOR_SIZE - 1) / 4.0
+    px = np.clip(np.rint((view_x + 2.0) * scale), 0, ATTRACTOR_SIZE - 1).astype(
+        np.int32
+    )
+    py = np.clip(np.rint((2.0 - view_y) * scale), 0, ATTRACTOR_SIZE - 1).astype(
+        np.int32
+    )
+    flat = py * ATTRACTOR_SIZE + px
+    density = np.bincount(
+        flat,
+        minlength=ATTRACTOR_SIZE * ATTRACTOR_SIZE,
+    ).reshape(ATTRACTOR_SIZE, ATTRACTOR_SIZE)
+    current = np.sqrt(density.astype(np.float32)) * (
+        50.0
+        + 65.0 * np.sqrt(max(left, right))
+        + 55.0 * np.sqrt(max(bass_left, bass_right))
+    )
+    _attractor_trail[:] *= 0.87
+    np.maximum(_attractor_trail, current, out=_attractor_trail)
+    _attractor_frame = np.clip(np.rint(_attractor_trail), 0, 255).astype(np.uint8)
+    return _attractor_frame
 
 
 def render_frame(mode: str, block: np.ndarray, width: int, height: int) -> np.ndarray:
@@ -560,7 +882,7 @@ def render_frame(mode: str, block: np.ndarray, width: int, height: int) -> np.nd
         case "Bass-anchored recurrence plot":
             return bass_anchored_recurrence(w, h)
         case "Oscilloscope":
-            return lsao.live_oscilloscope(block, w, h, 1, 1)
+            return xy_oscilloscope_line(block, w, h)
         case "Polar":
             return lsao.live_polar(block, CHANNEL, w, h, 0, "C4", 1, 1)
         case "PolarStereo":
@@ -569,6 +891,8 @@ def render_frame(mode: str, block: np.ndarray, width: int, height: int) -> np.nd
             return lsao.live_poincare(block, CHANNEL, w, h, 10, 1, 1)
         case "DelayEmbed":
             return lsao.live_delay_embed(block, STEREO, w, h, 10, 20, 0, 0.25, 1, 1)
+        case "Strange Attractor":
+            return strange_attractor(block)
         case "Envelope":
             return lsao.live_envelope(block, CHANNEL, w, h, 1, "Filled Envelope", 1)
         case "Chladni":
@@ -864,9 +1188,18 @@ class Kiosk:
         self._fps_n += 1
         if self._fps_n >= 300:
             elapsed = time.perf_counter() - self._fps_t
+            fractal_status = ""
+            if mode == "Strange Attractor":
+                fractal_status = (
+                    f" rms={_fractal_input_rms[0]:.4f}/{_fractal_input_rms[1]:.4f}"
+                    f" env={_fractal_levels[0]:.2f}/{_fractal_levels[1]:.2f}"
+                    f" bass={_fractal_bass_levels[0]:.3f}/"
+                    f"{_fractal_bass_levels[1]:.3f}"
+                )
             print(
                 f"lsao fps={self._fps_n / elapsed:.1f} "
-                f"avg_draw_ms={self._draw_ms / self._fps_n * 1000:.1f} mode={mode}",
+                f"avg_draw_ms={self._draw_ms / self._fps_n * 1000:.1f} "
+                f"mode={mode}{fractal_status}",
                 file=sys.stderr,
                 flush=True,
             )

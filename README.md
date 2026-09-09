@@ -43,7 +43,12 @@ The audio trigger and the displayed audio are separate. For example, Bass
 Harmonic Anchor filters a hidden trigger signal but displays fresh, unfiltered
 audio. Spectral Seismograph analyzes three bands without automatic gain:
 30–120 Hz, 180–1800 Hz, and 2.5–20 kHz. Bass-anchored recurrence plot compares
-three-sample delay states over a fresh, phase-locked two-cycle bass sweep.
+three-sample delay states over a fresh, phase-locked two-cycle bass sweep and
+maps state similarity continuously from white through gray to black. A noise
+gate keeps silence black; musical input above it is normalized for visibility.
+Strange Attractor draws a conventional De Jong orbit. Separate left/right
+broadband levels provide its main evolution, while 30–150 Hz energy adds phase
+acceleration and brightness. Short trails join successive shapes.
 
 ## Repository and installed paths
 
