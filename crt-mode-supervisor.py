@@ -2,8 +2,9 @@
 """GPIO kiosk supervisor: LSaO visualizer and USB VLC.
 
 GPIO 27 (header pin 13) to GND: toggle LSaO <-> USB video.
-GPIO 22 (header pin 15) to GND: short press next LSaO vis, hold to go back
-(ignored during video).
+GPIO 22 (header pin 15) to GND: short press next LSaO vis, hold to go back,
+or hold five seconds to toggle ten-second automatic cycling (ignored during
+video).
 Boot default is LSaO.
 """
 
@@ -44,6 +45,8 @@ BOUNCE_S = 0.03
 SWITCH_LOCKOUT_S = 1.0
 AFFECT_LOCKOUT_S = 0.08
 AFFECT_HOLD_S = 0.4
+AFFECT_AUTO_HOLD_S = 5.0
+AUTO_CYCLE_S = 10.0
 HEAVY_PIXELS = 1280 * 720
 LSAO_DIR = HOME / "LSaO-visualizer"
 
@@ -458,6 +461,9 @@ class ModeSupervisor:
         self.pending_affect = False
         self.affect_held = False
         self.affect_long = False
+        self.affect_pressed_at = 0.0
+        self.auto_cycle = False
+        self.last_auto_advance = time.monotonic()
         self.playing_cached = False
         self.current_sources: list[Path] = []
         self.stop_transcode = threading.Event()
@@ -477,18 +483,39 @@ class ModeSupervisor:
             return
         self.affect_held = True
         self.affect_long = False
+        self.affect_pressed_at = time.monotonic()
 
     def affect_held_cb(self, *_args) -> None:
         if not self.affect_held or self.affect_long:
             return
         self.affect_long = True
-        self.affect(-1)
+        self.toggle_auto_cycle()
 
     def release_affect(self, *_args) -> None:
         if self.affect_held and not self.affect_long:
-            self.affect(1)
+            held_for = time.monotonic() - self.affect_pressed_at
+            self.affect(-1 if held_for >= AFFECT_HOLD_S else 1)
         self.affect_held = False
         self.affect_long = False
+
+    def toggle_auto_cycle(self) -> None:
+        if self.mode != "lsao" or self.lsao is None or self.lsao.poll() is not None:
+            logging.info("auto cycle toggle ignored in mode=%s", self.mode)
+            return
+        self.auto_cycle = not self.auto_cycle
+        self.last_auto_advance = time.monotonic()
+        logging.info("lsao: auto cycle %s", "on" if self.auto_cycle else "off")
+
+    def maybe_auto_advance(self) -> None:
+        if (
+            not self.auto_cycle
+            or self.mode != "lsao"
+            or self.lsao is None
+            or self.lsao.poll() is not None
+        ):
+            return
+        if (time.monotonic() - self.last_auto_advance) >= AUTO_CYCLE_S:
+            self.affect(1)
 
     def kill_visuals(self) -> None:
         kill_proc(self.lsao, "lsao")
@@ -510,6 +537,7 @@ class ModeSupervisor:
         time.sleep(0.3)
         self.lsao = spawn(lsao_command(), "lsao", cwd=LSAO_DIR)
         self.mode = "lsao"
+        self.last_auto_advance = time.monotonic()
         logging.info("mode=lsao")
         return True
 
@@ -624,6 +652,7 @@ class ModeSupervisor:
             return
         if self.mode == "lsao" and self.lsao is not None and self.lsao.poll() is None:
             self.last_affect = now
+            self.last_auto_advance = time.monotonic()
             if step < 0:
                 poke_lsao(b"p")
                 logging.info("lsao: previous visualizer")
@@ -637,6 +666,7 @@ class ModeSupervisor:
         if self.pending_toggle:
             self.pending_toggle = False
             self.toggle()
+        self.maybe_auto_advance()
         if self.busy:
             return
         if self.mode == "video":
@@ -664,7 +694,7 @@ def main() -> int:
         AFFECT_PIN,
         pull_up=True,
         bounce_time=BOUNCE_S,
-        hold_time=AFFECT_HOLD_S,
+        hold_time=AFFECT_AUTO_HOLD_S,
         hold_repeat=False,
     )
     affect.when_pressed = sup.request_affect
@@ -673,7 +703,8 @@ def main() -> int:
     signal.signal(signal.SIGUSR1, lambda *_: sup.request_toggle())
     signal.signal(signal.SIGUSR2, lambda *_: sup.affect(1))
     logging.info(
-        "GPIO %s toggles LSaO/VLC; GPIO %s short=next vis, hold=previous",
+        "GPIO %s toggles LSaO/VLC; GPIO %s short=next, hold=previous, "
+        "5s=toggle 10s auto cycle",
         GPIO_PIN, AFFECT_PIN,
     )
 

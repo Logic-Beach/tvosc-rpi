@@ -40,6 +40,7 @@ STEREO = "Both (Stereo)"
 # 2000 Hz puts bass/mids on screen instead of spreading out to 13 kHz.
 SPECTRUM_XLOW = 1
 SPECTRUM_XHIGH = 2000
+SCOPE_DOT_THICKNESS = 2
 
 # Every vis renders at 300x300, then nearest-neighbor stretched to fill the CRT.
 # Order matches the upstream LSaO menu, with a triggered bass waveform after
@@ -1227,13 +1228,30 @@ def render_frame(mode: str, block: np.ndarray, width: int, height: int) -> np.nd
         case "Oscilloscope":
             return xy_oscilloscope_line(block, w, h)
         case "Polar":
-            return lsao.live_polar(block, CHANNEL, w, h, 0, "C4", 1, 1)
+            return lsao.live_polar(
+                block, CHANNEL, w, h, 0, "C4", 1, SCOPE_DOT_THICKNESS
+            )
         case "PolarStereo":
-            return lsao.live_polar_stereo(block, w, h, 0, "C4", 1, 1)
+            return lsao.live_polar_stereo(
+                block, w, h, 0, "C4", 1, SCOPE_DOT_THICKNESS
+            )
         case "Poincare":
-            return lsao.live_poincare(block, CHANNEL, w, h, 10, 1, 1)
+            return lsao.live_poincare(
+                block, CHANNEL, w, h, 10, 1, SCOPE_DOT_THICKNESS
+            )
         case "DelayEmbed":
-            return lsao.live_delay_embed(block, STEREO, w, h, 10, 20, 0, 0.25, 1, 1)
+            return lsao.live_delay_embed(
+                block,
+                STEREO,
+                w,
+                h,
+                10,
+                20,
+                0,
+                0.25,
+                1,
+                SCOPE_DOT_THICKNESS,
+            )
         case "Strange Attractor":
             return strange_attractor(block)
         case "Starfield Zoom":

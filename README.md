@@ -93,7 +93,8 @@ Controls:
 
 - GPIO 27 press: toggle LSaO ↔ USB video
 - GPIO 22 short press: next visualization
-- GPIO 22 hold for 0.4 seconds: previous visualization
+- GPIO 22 hold for 0.4–5 seconds: previous visualization on release
+- GPIO 22 hold for 5 seconds: toggle automatic cycling every 10 seconds
 - Affect presses are ignored while USB video is active
 
 ## Install the software
