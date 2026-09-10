@@ -59,7 +59,7 @@ MODES = [
     "Oscilloscope",
     #"Polar",
     "PolarStereo",
-    "Poincare",
+    #"Poincare",
     "DelayEmbed",
     "Strange Attractor",
     "Starfield Zoom",
@@ -195,21 +195,21 @@ _fractal_bass_input = np.zeros(2, dtype=np.float32)
 _fractal_bass_levels = np.zeros(2, dtype=np.float32)
 _fractal_level_time = 0.0
 
-ATTRACTOR_SIZE = 112
+ATTRACTOR_SIZE = 200
 ATTRACTOR_POINTS = 1400
-ATTRACTOR_BURN_IN = 60
+ATTRACTOR_BURN_IN = 80
 _attractor_frame = np.zeros((ATTRACTOR_SIZE, ATTRACTOR_SIZE), dtype=np.uint8)
 _attractor_frame_time = 0.0
 _attractor_phase = np.zeros(2, dtype=np.float64)
 _attractor_coefficients = np.array([1.40, -2.30, 2.40, -2.10])
 _attractor_trail = np.zeros((ATTRACTOR_SIZE, ATTRACTOR_SIZE), dtype=np.float32)
 
-STARFIELD_MAX_STARS = 480
-STARFIELD_MIN_STARS = 72
+STARFIELD_MAX_STARS = 800
+STARFIELD_MIN_STARS = 0
 STARFIELD_NEAR_Z = 0.08
-STARFIELD_FAR_Z = 4.8
+STARFIELD_FAR_Z = 4#4.8
 STARFIELD_SPEED = 0.72
-STARFIELD_HIGH_FULL = 0.025
+STARFIELD_HIGH_FULL = 0.05
 _starfield_rng = np.random.default_rng(1983)
 _starfield_x = _starfield_rng.uniform(-1.25, 1.25, STARFIELD_MAX_STARS)
 _starfield_y = _starfield_rng.uniform(-1.25, 1.25, STARFIELD_MAX_STARS)
