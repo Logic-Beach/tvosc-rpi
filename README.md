@@ -55,6 +55,10 @@ Starfield Zoom projects a deterministic pool of stars toward the viewer:
 full-band volume onsets spawn bursts from deep near the vanishing point and
 create short forward warp pulses. High-frequency energy enlarges and brightens
 stars, and stereo balance moves the vanishing point.
+Hall of Mirrors lights the screen perimeter from left/right RMS and repeatedly
+shrinks that outline into a fading tunnel. Overall volume subtly thickens its
+rounded border; bass pulls the centered hallway downward and treble pulls it
+upward.
 
 ## Repository and installed paths
 

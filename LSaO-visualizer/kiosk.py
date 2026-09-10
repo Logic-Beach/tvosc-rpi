@@ -63,6 +63,7 @@ MODES = [
     "DelayEmbed",
     "Strange Attractor",
     "Starfield Zoom",
+    "Hall of Mirrors",
    #"Chladni",
    # "Envelope",
 ]
@@ -226,6 +227,25 @@ _starfield_pan = 0.0
 _starfield_warp = 0.0
 _starfield_spawn_credit = 0.0
 _starfield_time = 0.0
+
+MIRROR_SHRINK = 0.97
+MIRROR_DECAY = 0.975
+MIRROR_CORNER_RADIUS = 0.10
+MIRROR_VOLUME_GATE = 0.005
+MIRROR_VOLUME_FULL = 0.45
+MIRROR_BASS_FULL = 0.12
+MIRROR_HIGH_FULL = 0.04
+_mirror_frame = np.zeros((INTERNAL, INTERNAL), dtype=np.float32)
+_mirror_levels = np.zeros(2, dtype=np.float32)
+_mirror_tilt = 0.0
+_mirror_bass = 0.0
+_mirror_high = 0.0
+_mirror_border_width = 50
+_mirror_time = 0.0
+_mirror_scale_phase = False
+_mirror_edge_shape = (0, 0)
+_mirror_edge_layers: tuple[np.ndarray, ...] = ()
+_mirror_screen_mask = np.zeros((INTERNAL, INTERNAL), dtype=bool)
 
 
 def request_next(*_args) -> None:
@@ -1035,6 +1055,145 @@ def starfield_zoom(block: np.ndarray, width: int, height: int) -> np.ndarray:
     return frame
 
 
+def _mirror_edges(width: int, height: int) -> tuple[np.ndarray, ...]:
+    """Return cached inside edge layers for a rounded CRT silhouette."""
+    global _mirror_edge_shape, _mirror_edge_layers, _mirror_screen_mask
+    shape = (height, width)
+    if _mirror_edge_shape == shape:
+        return _mirror_edge_layers
+
+    yy, xx = np.ogrid[:height, :width]
+    base_radius = max(5, int(round(min(width, height) * MIRROR_CORNER_RADIUS)))
+    fills = []
+    for inset in range(6):
+        radius = min(
+            max(1, base_radius - inset),
+            max(1, (width - 2 * inset - 1) // 2),
+            max(1, (height - 2 * inset - 1) // 2),
+        )
+        nearest_x = np.clip(xx, inset + radius, width - 1 - inset - radius)
+        nearest_y = np.clip(yy, inset + radius, height - 1 - inset - radius)
+        fills.append(
+            (xx - nearest_x) ** 2 + (yy - nearest_y) ** 2 <= radius * radius
+        )
+    _mirror_edge_layers = tuple(
+        fills[inset] & ~fills[inset + 1] for inset in range(5)
+    )
+    _mirror_screen_mask = fills[0]
+    _mirror_edge_shape = shape
+    return _mirror_edge_layers
+
+
+def hall_of_mirrors(block: np.ndarray, width: int, height: int) -> np.ndarray:
+    """RMS-lit edges recede toward a stereo- and spectrum-driven vanishing point."""
+    global _mirror_frame, _mirror_time, _mirror_tilt
+    global _mirror_bass, _mirror_high, _mirror_border_width
+    global _mirror_scale_phase
+    w = max(2, int(width))
+    h = max(2, int(height))
+    now = time.monotonic()
+    dt = (
+        1.0 / max(FPS, 1)
+        if _mirror_time <= 0.0
+        else float(np.clip(now - _mirror_time, 0.001, 0.05))
+    )
+    _mirror_time = now
+
+    stereo = prep_block(block)
+    if stereo.size:
+        channel_rms = np.sqrt(np.mean(np.square(stereo[:, :2]), axis=0))
+        mono = np.mean(stereo[:, :2], axis=1)
+    else:
+        channel_rms = np.zeros(2, dtype=np.float32)
+        mono = np.zeros(0, dtype=np.float32)
+
+    bass = fractal_bass_tail(FRACTAL_BASS_SAMPLES)
+    bass_level = float(np.sqrt(np.mean(np.square(bass)))) if bass.size else 0.0
+    high = _long_bandpass(mono, 2)
+    high_level = float(np.sqrt(np.mean(np.square(high)))) if high.size else 0.0
+    bass_target = float(np.clip(bass_level / MIRROR_BASS_FULL, 0.0, 1.0))
+    high_target = float(np.clip(high_level / MIRROR_HIGH_FULL, 0.0, 1.0))
+    tilt_target = float(np.clip(bass_target - high_target, -1.0, 1.0))
+    level_targets = np.clip(
+        (channel_rms - MIRROR_VOLUME_GATE)
+        / (MIRROR_VOLUME_FULL - MIRROR_VOLUME_GATE),
+        0.0,
+        1.0,
+    )
+
+    level_tau = np.where(level_targets > _mirror_levels, 0.012, 0.075)
+    _mirror_levels[:] += (level_targets - _mirror_levels) * (
+        1.0 - np.exp(-dt / level_tau)
+    )
+    _mirror_tilt += (tilt_target - _mirror_tilt) * (
+        1.0 - math.exp(-dt / 0.12)
+    )
+    _mirror_bass += (bass_target - _mirror_bass) * (
+        1.0 - math.exp(-dt / 0.08)
+    )
+    _mirror_high += (high_target - _mirror_high) * (
+        1.0 - math.exp(-dt / 0.08)
+    )
+
+    if _mirror_frame.shape != (h, w):
+        _mirror_frame = np.zeros((h, w), dtype=np.float32)
+    scaled_w = max(2, int(round(w * MIRROR_SHRINK)))
+    scaled_h = max(2, int(round(h * MIRROR_SHRINK)))
+    if (w - scaled_w) % 2:
+        scaled_w += 1 if _mirror_scale_phase else -1
+    if (h - scaled_h) % 2:
+        scaled_h += 1 if _mirror_scale_phase else -1
+    _mirror_scale_phase = not _mirror_scale_phase
+    center_x = 0.5 * (w - 1)
+    center_y = 0.5 * (h - 1) + 0.025 * h * _mirror_tilt
+    x0 = int(round(center_x - 0.5 * (scaled_w - 1)))
+    y0 = int(round(center_y - 0.5 * (scaled_h - 1)))
+    dx0 = max(0, x0)
+    dy0 = max(0, y0)
+    dx1 = min(w, x0 + scaled_w)
+    dy1 = min(h, y0 + scaled_h)
+    next_frame = np.zeros((h, w), dtype=np.float32)
+    if dx1 > dx0 and dy1 > dy0:
+        sx = np.rint(
+            (np.arange(dx0, dx1) - x0) * (w - 1) / (scaled_w - 1)
+        ).astype(np.int32)
+        sy = np.rint(
+            (np.arange(dy0, dy1) - y0) * (h - 1) / (scaled_h - 1)
+        ).astype(np.int32)
+        next_frame[dy0:dy1, dx0:dx1] = (
+            _mirror_frame[np.ix_(sy, sx)] * MIRROR_DECAY
+        )
+
+    edge_layers = _mirror_edges(w, h)
+    edge_levels = _mirror_levels * _mirror_levels * (3.0 - 2.0 * _mirror_levels)
+    _mirror_border_width = 2.5 + 1.5 * float(np.mean(edge_levels))
+    horizontal_edge = np.linspace(
+        edge_levels[0],
+        edge_levels[1],
+        w,
+        dtype=np.float32,
+    ) * 255.0
+    edge_brightness = np.broadcast_to(horizontal_edge[None, :], (h, w))
+    for layer_i, (layer, gain) in enumerate(
+        zip(
+            edge_layers,
+            (1.0, 0.72, 0.50, 0.34, 0.22),
+            strict=True,
+        )
+    ):
+        coverage = float(np.clip(_mirror_border_width - layer_i, 0.0, 1.0))
+        if coverage <= 0.0:
+            break
+        next_frame[layer] = np.maximum(
+            next_frame[layer],
+            edge_brightness[layer] * gain * coverage,
+        )
+    next_frame[~_mirror_screen_mask] = 0.0
+
+    _mirror_frame = next_frame
+    return np.clip(np.rint(_mirror_frame), 0.0, 255.0).astype(np.uint8)
+
+
 def render_frame(mode: str, block: np.ndarray, width: int, height: int) -> np.ndarray:
     w, h = int(width), int(height)
     match mode:
@@ -1079,6 +1238,8 @@ def render_frame(mode: str, block: np.ndarray, width: int, height: int) -> np.nd
             return strange_attractor(block)
         case "Starfield Zoom":
             return starfield_zoom(block, w, h)
+        case "Hall of Mirrors":
+            return hall_of_mirrors(block, w, h)
         case "Envelope":
             return lsao.live_envelope(block, CHANNEL, w, h, 1, "Filled Envelope", 1)
         case "Chladni":
@@ -1390,6 +1551,14 @@ class Kiosk:
                     f" high={_starfield_high:.2f}"
                     f" pan={_starfield_pan:.2f}"
                     f" warp={_starfield_warp:.2f}"
+                )
+            elif mode == "Hall of Mirrors":
+                fractal_status = (
+                    f" rms={_mirror_levels[0]:.2f}/{_mirror_levels[1]:.2f}"
+                    f" bass={_mirror_bass:.2f}"
+                    f" high={_mirror_high:.2f}"
+                    f" tilt={_mirror_tilt:.2f}"
+                    f" border={_mirror_border_width:.1f}"
                 )
             print(
                 f"lsao fps={self._fps_n / elapsed:.1f} "
