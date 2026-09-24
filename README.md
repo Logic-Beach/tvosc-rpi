@@ -35,13 +35,20 @@ changes the active LSaO visualization.
    the 4:3 CRT.
 6. GPIO 22 sends `n` or `p` through `~/.local/state/lsao-next`, a named FIFO
    read by the kiosk.
-7. GPIO 27 stops the current process and either starts LSaO or scans a mounted
-   USB drive and starts fullscreen VLC.
-8. The supervisor reaps and restarts LSaO if the renderer exits.
+7. USB mounting and indexing happen in a background thread, outside the GPIO
+   button path.
+8. GPIO 27 starts fullscreen VLC over the existing LSaO window. LSaO pauses
+   rendering but stays loaded, so switching back only has to close VLC.
+9. The supervisor reaps and restarts LSaO if the renderer exits.
 
 The audio trigger and the displayed audio are separate. For example, Bass
 Harmonic Anchor filters a hidden trigger signal but displays fresh, unfiltered
-audio. Spectral Seismograph analyzes three bands without automatic gain:
+audio. Bass Harmonic Scan uses that same triggered sweep but walks a bold
+live trace from the top of the screen to the bottom. Older copies stay
+behind as softer, progressively blurrier echoes and hard-cut once they
+fall below a brightness floor. A noise gate skips new echoes when the
+sweep is too quiet, so silence does not leave a trail.
+Spectral Seismograph analyzes three bands without automatic gain:
 30–180 Hz, 180–1800 Hz, and 2.5–20 kHz. It draws all three as live vertical
 waveforms over the same bass-triggered sweep, keeping their harmonic timing
 aligned without holding old frames. Bass-anchored recurrence plot compares
@@ -58,7 +65,10 @@ stars, and stereo balance moves the vanishing point.
 Hall of Mirrors lights the screen perimeter from left/right RMS and repeatedly
 shrinks that outline into a fading tunnel. Overall volume subtly thickens its
 rounded border; bass pulls the centered hallway downward and treble pulls it
-upward.
+upward. Waveform Hall of Mirrors leaves the vanishing point fixed, places a
+bass-anchored mono waveform below 250 Hz on the bottom edge and a 250 Hz–2 kHz
+midrange waveform on the top edge, then recursively shrinks those two edges
+into an infinite tunnel.
 
 ## Repository and installed paths
 
@@ -92,10 +102,10 @@ gpiozero enables the pull-up resistors, so external resistors are unnecessary.
 Controls:
 
 - GPIO 27 press: toggle LSaO ↔ USB video
-- GPIO 22 short press: next visualization
-- GPIO 22 hold for 0.4–5 seconds: previous visualization on release
-- GPIO 22 hold for 5 seconds: toggle automatic cycling every 10 seconds
-- Affect presses are ignored while USB video is active
+- GPIO 22 short press: next visualization or video
+- GPIO 22 hold for 0.4–5 seconds: previous visualization or video
+- GPIO 22 hold for 5 seconds in LSaO: toggle automatic cycling every 10 seconds
+- GPIO 22 hold for 5 seconds in video mode: previous video on release
 
 ## Install the software
 
@@ -125,9 +135,8 @@ python3 -m venv --system-site-packages /home/pi/LSaO-visualizer/venv
 /home/pi/LSaO-visualizer/venv/bin/pip install sounddevice
 ```
 
-The kiosk normally captures through `arecord`; `sounddevice` is still needed
-because the imported upstream LSaO module imports it and it provides the last
-audio fallback.
+The kiosk normally captures through `arecord`; `sounddevice` is imported only
+if it is needed as the last audio fallback.
 
 Select direct ALSA capture:
 
@@ -259,10 +268,27 @@ USB video behavior:
 - Directories are searched recursively
 - Hidden files and macOS `._*` files are ignored
 - Common VLC video extensions are accepted
-- VLC loops all discovered files fullscreen at 4:3
-- Video larger than 1280×720 is converted to a 720×480 H.264 cache
-- The first conversion can start with a quick proxy while the complete cache
-  is built in the background
+- VLC plays discovered files fullscreen at 4:3 and advances to the next
+  file when one finishes, wrapping around the library
+- VLC audio is sent directly to the Pi's built-in analog output, not the USB
+  capture adapter
+- Mounting and directory scanning happen in the background
+- No probing or transcoding occurs during a mode-button press
+- Existing files in `/home/pi/.cache/crt-videos/` are still preferred, but
+  uncached files are handed directly to VLC
+- `SMALL_name.mp4` is preferred over a sibling `name.mkv`, `name.webm`, or
+  other source file, so both copies do not appear in the playlist
+
+For predictable Pi 3 playback, convert videos before copying them to the USB
+drive:
+
+```sh
+./convert-videos-small.sh /path/to/videos
+```
+
+This creates 640×480 H.264 MP4 files named `SMALL_<name>.mp4`, center-cropped
+to 4:3 without letterboxing. Keeping only the `SMALL_` copies on the USB drive
+minimizes indexing and decoding work.
 
 Set `CRT_VIDEO_DIR` to use a fixed directory instead of removable media.
 

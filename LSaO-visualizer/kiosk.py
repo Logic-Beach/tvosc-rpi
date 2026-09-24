@@ -3,7 +3,8 @@
 
 Renders each frame at 300x300, then nearest-neighbor stretches to fill 720x480.
 pygame SCALED letterboxed the square buffer; we blit onto a native 720x480
-window instead. SIGUSR2 cycles visualizer types.
+window instead. SIGUSR1 pauses rendering, SIGHUP resumes it, and SIGUSR2
+cycles visualizer types.
 """
 
 from __future__ import annotations
@@ -27,58 +28,41 @@ import numpy as np
 import pygame
 from scipy.signal import lfilter
 
-import main as lsao
-
 DISPLAY_W = 720
 DISPLAY_H = 480
+SAMPLERATE = 48000
 # Match NTSC composite field rate. The UHF modulator just rebroadcasts analog
 # video; it does not lock the vis to 24 fps. Override with OSC_FPS if needed.
 FPS = int(os.environ.get("OSC_FPS", "60"))
-CHANNEL = "Both (Merge to mono)"
-STEREO = "Both (Stereo)"
-# Linear spectrum currently maps 1–xhigh Hz across the full width.
-# 2000 Hz puts bass/mids on screen instead of spreading out to 13 kHz.
-SPECTRUM_XLOW = 1
-SPECTRUM_XHIGH = 2000
 SCOPE_DOT_THICKNESS = 2
 
 # Every vis renders at 300x300, then nearest-neighbor stretched to fill the CRT.
-# Order matches the upstream LSaO menu, with a triggered bass waveform after
-# Short Waveform. Chladni is one plate (Cosine).
+# Order matches the kiosk's affect-button cycle.
 INTERNAL = 300
-CHLADNI_PLATE = "Cosine"
 MODES = [
-    #"Spectrum",
-    #"SpectrumdB",
-   # "SpecBalance",
-   # "Histogram",
-   # "Waveform",
     "Bass Harmonic Anchor",
+    "Bass Harmonic Scan",
     "Spectral Seismograph",
-   # "Recurrence",
     "Bass-anchored recurrence plot",
     "Oscilloscope",
-    #"Polar",
     "PolarStereo",
-    #"Poincare",
     "DelayEmbed",
     "Strange Attractor",
     "Starfield Zoom",
     "Hall of Mirrors",
-   #"Chladni",
-   # "Envelope",
+    "Waveform Hall of Mirrors",
 ]
-RENDER_SIZE = {name: (INTERNAL, INTERNAL) for name in MODES}
-MIN_DIM = INTERNAL
 DEFAULT_MODE = "Bass Harmonic Anchor"
 
 pending_next = False
 pending_prev = False
+render_paused = False
 latest_block: np.ndarray | None = None
 _audio_stream = None
 _audio_proc: subprocess.Popen | None = None
 NEXT_LOCKOUT_S = 0.08
 AFFECT_FIFO = Path.home() / ".local/state" / "lsao-next"
+READY_PATH = Path.home() / ".local/state" / "lsao-ready"
 BACKEND_FILE = Path.home() / ".config" / "lsao" / "backend"
 _fifo_fd: int | None = None
 
@@ -87,8 +71,6 @@ _fifo_fd: int | None = None
 # unfiltered audio. A Schmitt-armed upward zero crossing is stable even when
 # the raw synth has large, moving harmonics.
 RING_SAMPLES = 16384
-# Free-running short trace: ~30 ms of audio (was one ~5 ms capture chunk).
-SHORT_WINDOW = 1440
 TRIG_WINDOW = 2400
 TRIG_WINDOW_MIN = 640
 TRIG_WINDOW_MAX = 3600
@@ -115,6 +97,21 @@ _lp_zi = [np.zeros(1, dtype=np.float64) for _ in range(TRIG_LP_POLES)]
 _total = 0
 _period = 0.0
 
+# Bass Harmonic Scan: the same triggered two-cycle sweep, drawn as a falling
+# CRT raster with phosphor persistence and a hard brightness cutoff.
+SCAN_ECHO_DECAY = 0.95
+SCAN_ECHO_CUTOFF = 5.0
+SCAN_ECHO_SPEED = 3.2
+SCAN_ECHO_AMPLITUDE = 0.15
+SCAN_ECHO_BLUR = 0.24
+SCAN_ECHO_STAMP = 160.0
+SCAN_ECHO_LIVE_THICKNESS = 3
+SCAN_ECHO_GATE = 0.008
+_scan_echo_buf: np.ndarray | None = None
+_scan_echo_scratch: np.ndarray | None = None
+_scan_echo_y = 0.0
+_scan_echo_blur_axis = 0
+
 # Bass-anchored recurrence: compare local three-sample states over the same
 # fresh two-cycle sweep used by Bass Harmonic Anchor.
 BASS_REC_EMBED_DIM = 3
@@ -140,6 +137,8 @@ _bass_rec_lut = np.rint(
 # aligned while fresh audio continues to replace every frame.
 LONG_BANDS = ((30.0, 180.0), (180.0, 1800.0), (2500.0, 20000.0))
 LONG_TRACE_GAIN = 1.75
+# Horizontal half-width in internal pixels: bass 5 px, mids 3 px, highs 1 px.
+LONG_TRACE_HALF_WIDTHS = (2, 1, 0)
 LONG_FILTER_POLES = (3, 2, 1)
 LONG_FILTER_PAD = 768
 _long_filter_coefficients = []
@@ -248,6 +247,51 @@ _mirror_edge_shape = (0, 0)
 _mirror_edge_layers: tuple[np.ndarray, ...] = ()
 _mirror_screen_mask = np.zeros((INTERNAL, INTERNAL), dtype=bool)
 
+WAVE_HALL_SHRINK = 0.80
+WAVE_HALL_DECAY = 0.975
+WAVE_HALL_GATE = 0.002
+WAVE_HALL_FULL_LEVEL = 0.030
+WAVE_HALL_MIN_REACH = 8.0
+WAVE_HALL_MAX_REACH = 60.0
+WAVE_HALL_SMOOTH_KERNEL = (
+    np.array([1.0, 2.0, 3.0, 2.0, 1.0], dtype=np.float32) / 9.0
+)
+WAVE_HALL_BASS_CUTOFF = 250.0
+WAVE_HALL_MID_HIGH_CUTOFF = 2000.0
+WAVE_HALL_FILTER_PAD = 256
+_wave_hall_bass_alpha = float(
+    1.0 - np.exp(-2.0 * np.pi * WAVE_HALL_BASS_CUTOFF / SAMPLERATE)
+)
+_wave_hall_bass_b = np.array([_wave_hall_bass_alpha], dtype=np.float64)
+_wave_hall_bass_a = np.array(
+    [1.0, _wave_hall_bass_alpha - 1.0],
+    dtype=np.float64,
+)
+_wave_hall_mid_hp_alpha = float(
+    np.exp(-2.0 * np.pi * WAVE_HALL_BASS_CUTOFF / SAMPLERATE)
+)
+_wave_hall_mid_hp_b = np.array(
+    [_wave_hall_mid_hp_alpha, -_wave_hall_mid_hp_alpha],
+    dtype=np.float64,
+)
+_wave_hall_mid_hp_a = np.array(
+    [1.0, -_wave_hall_mid_hp_alpha],
+    dtype=np.float64,
+)
+_wave_hall_mid_lp_alpha = float(
+    1.0 - np.exp(-2.0 * np.pi * WAVE_HALL_MID_HIGH_CUTOFF / SAMPLERATE)
+)
+_wave_hall_mid_lp_b = np.array(
+    [_wave_hall_mid_lp_alpha],
+    dtype=np.float64,
+)
+_wave_hall_mid_lp_a = np.array(
+    [1.0, _wave_hall_mid_lp_alpha - 1.0],
+    dtype=np.float64,
+)
+_wave_hall_frame = np.zeros((INTERNAL, INTERNAL), dtype=np.float32)
+_wave_hall_scale_phase = False
+
 
 def request_next(*_args) -> None:
     global pending_next
@@ -257,6 +301,16 @@ def request_next(*_args) -> None:
 def request_prev(*_args) -> None:
     global pending_prev
     pending_prev = True
+
+
+def request_pause(*_args) -> None:
+    global render_paused
+    render_paused = True
+
+
+def request_resume(*_args) -> None:
+    global render_paused
+    render_paused = False
 
 
 def open_affect_fifo() -> None:
@@ -503,6 +557,87 @@ def xy_oscilloscope_line(block: np.ndarray, width: int, height: int) -> np.ndarr
     return _polyline_frame(xs, ys, w, h)
 
 
+_polar_phase = 0.0
+
+
+def _map_samples_to_axis(samples: np.ndarray, size: int) -> np.ndarray:
+    values = np.nan_to_num(
+        np.asarray(samples, dtype=np.float32),
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0,
+    )
+    mapped = (values * 31130.0 + 32768.0) * (int(size) - 1) / 65535.0
+    return np.clip(mapped, 0, int(size) - 1).astype(np.int32)
+
+
+def _thick_point_frame(
+    xs: np.ndarray,
+    ys: np.ndarray,
+    width: int,
+    height: int,
+    thickness: int,
+) -> np.ndarray:
+    frame = np.zeros((height, width), dtype=np.uint8)
+    frame[
+        np.clip(ys, 0, height - 1),
+        np.clip(xs, 0, width - 1),
+    ] = 255
+    for _ in range(max(0, int(thickness) - 1)):
+        up = np.roll(frame, -1, axis=0)
+        up[-1, :] = 0
+        left = np.roll(frame, -1, axis=1)
+        left[:, -1] = 0
+        frame = np.maximum(frame, np.maximum(up, left))
+    return frame
+
+
+def polar_stereo(block: np.ndarray, width: int, height: int) -> np.ndarray:
+    """Stereo polar renderer without importing the upstream Tk application."""
+    global _polar_phase
+    stereo = prep_block(block)
+    if stereo.shape[0] < 2:
+        return np.zeros((height, width), dtype=np.uint8)
+    count = int(stereo.shape[0])
+    # Upstream's C4 setting advances at twice the note frequency.
+    speed = 2.0 * 261.625565
+    phase_end = _polar_phase + speed * count / SAMPLERATE
+    theta = np.linspace(_polar_phase, phase_end, count, dtype=np.float32)
+    _polar_phase = phase_end % (2.0 * np.pi)
+    audio_l = stereo[:, 0] * np.sin(theta)
+    audio_r = stereo[:, 1] * np.cos(theta)
+    half_sqrt_two = math.sqrt(2.0) * 0.5
+    rotated_l = (audio_r + audio_l) * half_sqrt_two
+    rotated_r = (-audio_r + audio_l) * half_sqrt_two
+    ys = _map_samples_to_axis(rotated_l, height)
+    xs = _map_samples_to_axis(rotated_r, width)
+    return _thick_point_frame(xs, ys, width, height, SCOPE_DOT_THICKNESS)
+
+
+def delay_embed(block: np.ndarray, width: int, height: int) -> np.ndarray:
+    """Three-axis stereo delay embedding used by the kiosk's active preset."""
+    stereo = prep_block(block)
+    if stereo.shape[0] < 2:
+        return np.zeros((height, width), dtype=np.uint8)
+    audio_0 = -np.mean(stereo[:, :2], axis=1)
+    audio_1 = np.roll(stereo[:, 0], -10)
+    audio_2 = np.roll(stereo[:, 1], -20)
+    alpha = 2.0 * np.pi * 0.25 * time.time()
+    projected_x = math.cos(alpha) * audio_0 + math.sin(alpha) * audio_2
+    projected_y = audio_1
+    xs = np.clip(
+        projected_x * width / 3.0 + width / 2.0,
+        0,
+        width - 1,
+    ).astype(np.int32)
+    ys = np.clip(
+        projected_y * height / 3.0 + height / 2.0,
+        0,
+        height - 1,
+    ).astype(np.int32)
+    return _thick_point_frame(xs, ys, width, height, SCOPE_DOT_THICKNESS)
+
+
 def _long_bandpass(wave: np.ndarray, band_i: int) -> np.ndarray:
     """Apply a low-cost causal bandpass with reflected warm-up samples."""
     if wave.size < 2:
@@ -551,11 +686,20 @@ def spectral_seismograph(width: int, height: int) -> np.ndarray:
         ).astype(np.int32)
         lo = np.minimum(x[:-1], x[1:])
         hi = np.maximum(x[:-1], x[1:])
+        trace_half_width = LONG_TRACE_HALF_WIDTHS[band_i]
         columns = np.arange(col0, col1 + 1, dtype=np.int32)[None, :]
-        connected = (columns >= lo[:, None]) & (columns <= hi[:, None])
+        connected = (
+            (columns >= (lo - trace_half_width)[:, None])
+            & (columns <= (hi + trace_half_width)[:, None])
+        )
         lane = frame[: h - 1, col0 : col1 + 1]
         lane[connected] = 255
-        frame[h - 1, int(x[-1])] = 255
+        last_x = int(x[-1])
+        frame[
+            h - 1,
+            max(col0, last_x - trace_half_width) :
+            min(col1 + 1, last_x + trace_half_width + 1),
+        ] = 255
     return frame
 
 
@@ -656,7 +800,7 @@ def locked_window() -> np.ndarray:
         return stereo[-_window_len(_period, n) :]
     gate = max(TRIG_GATE_MIN, TRIG_GATE_FRAC * level)
     hits = _scope_crossings(centered, gate)
-    fs = float(lsao.SAMPLERATE)
+    fs = float(SAMPLERATE)
     measured = _period_from_crossings(hits, fs)
     T = _smooth_period(measured)
     window = _window_len(T, n)
@@ -670,6 +814,88 @@ def locked_window() -> np.ndarray:
     # The newest complete sweep is new raw input; no held/copied frame exists.
     i = int(eligible[-1])
     return stereo[i : i + window]
+
+
+def _soften_scan_echo(buf: np.ndarray, scratch: np.ndarray) -> None:
+    """Age echoes with an alternating 3-tap box blur so older trails haze out."""
+    global _scan_echo_blur_axis
+    mix = float(SCAN_ECHO_BLUR)
+    if mix <= 0.0:
+        return
+    axis = _scan_echo_blur_axis
+    _scan_echo_blur_axis = 1 - axis
+    if axis == 0:
+        scratch[0, :] = buf[0, :]
+        scratch[-1, :] = buf[-1, :]
+        np.add(buf[:-2], buf[1:-1], out=scratch[1:-1])
+        scratch[1:-1] += buf[2:]
+    else:
+        scratch[:, 0] = buf[:, 0]
+        scratch[:, -1] = buf[:, -1]
+        np.add(buf[:, :-2], buf[:, 1:-1], out=scratch[:, 1:-1])
+        scratch[:, 1:-1] += buf[:, 2:]
+    scratch *= 1.0 / 3.0
+    buf *= 1.0 - mix
+    buf += mix * scratch
+
+
+def _thicken_trace(frame: np.ndarray, thickness: int) -> np.ndarray:
+    """Dilate a binary polyline so the live sweep reads denser than echoes."""
+    out = frame
+    for _ in range(max(0, int(thickness) - 1)):
+        up = np.roll(out, -1, axis=0)
+        up[-1, :] = 0
+        down = np.roll(out, 1, axis=0)
+        down[0, :] = 0
+        left = np.roll(out, -1, axis=1)
+        left[:, -1] = 0
+        right = np.roll(out, 1, axis=1)
+        right[:, 0] = 0
+        out = np.maximum.reduce((out, up, down, left, right))
+    return out
+
+
+def bass_harmonic_scan(width: int, height: int) -> np.ndarray:
+    """Bass Harmonic Anchor sweep that scans top to bottom with phosphor echo."""
+    global _scan_echo_buf, _scan_echo_scratch, _scan_echo_y
+    w = max(int(width), 2)
+    h = max(int(height), 2)
+    if _scan_echo_buf is None or _scan_echo_buf.shape != (h, w):
+        _scan_echo_buf = np.zeros((h, w), dtype=np.float32)
+        _scan_echo_scratch = np.zeros((h, w), dtype=np.float32)
+        _scan_echo_y = 0.0
+    buf = _scan_echo_buf
+    scratch = _scan_echo_scratch
+    np.multiply(buf, SCAN_ECHO_DECAY, out=buf)
+    _soften_scan_echo(buf, scratch)
+    buf[buf < SCAN_ECHO_CUTOFF] = 0.0
+
+    live = None
+    stereo = prep_block(locked_window())
+    if stereo.shape[0] >= 2:
+        mono = np.mean(stereo, axis=1)
+        n = int(mono.shape[0])
+        wave = np.interp(
+            np.linspace(0.0, n - 1.0, w),
+            np.arange(n, dtype=np.float32),
+            mono,
+        )
+        amp = 0.95 * SCAN_ECHO_AMPLITUDE * (h - 1)
+        ys = np.clip(_scan_echo_y - wave * amp, 0, h - 1).astype(np.int32)
+        thin = _polyline_frame(np.arange(w, dtype=np.int32), ys, w, h)
+        live = _thicken_trace(thin, SCAN_ECHO_LIVE_THICKNESS)
+        level = float(np.percentile(np.abs(wave), 90))
+        if level >= SCAN_ECHO_GATE:
+            stamp = thin.astype(np.float32) * (SCAN_ECHO_STAMP / 255.0)
+            np.maximum(buf, stamp, out=buf)
+
+    _scan_echo_y += SCAN_ECHO_SPEED
+    if _scan_echo_y >= h:
+        _scan_echo_y -= h
+    frame = np.clip(np.rint(buf), 0.0, 255.0).astype(np.uint8)
+    if live is not None:
+        np.maximum(frame, live, out=frame)
+    return frame
 
 
 def bass_anchored_recurrence(width: int, height: int) -> np.ndarray:
@@ -1195,73 +1421,161 @@ def hall_of_mirrors(block: np.ndarray, width: int, height: int) -> np.ndarray:
     return np.clip(np.rint(_mirror_frame), 0.0, 255.0).astype(np.uint8)
 
 
+def _wave_hall_frequency_edges(
+    stereo: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return mono <250 Hz and 250 Hz–2 kHz waveforms for bottom/top."""
+    mono = np.mean(stereo[:, :2], axis=1)
+    mono = mono - float(np.mean(mono))
+    pad = min(WAVE_HALL_FILTER_PAD, int(mono.size) - 1)
+    source = np.pad(
+        np.asarray(mono, dtype=np.float64),
+        (pad, 0),
+        mode="reflect",
+    )
+    bass = source
+    for _ in range(3):
+        bass = lfilter(_wave_hall_bass_b, _wave_hall_bass_a, bass)
+    mids = source
+    for _ in range(2):
+        mids = lfilter(
+            _wave_hall_mid_hp_b,
+            _wave_hall_mid_hp_a,
+            mids,
+        )
+    for _ in range(2):
+        mids = lfilter(
+            _wave_hall_mid_lp_b,
+            _wave_hall_mid_lp_a,
+            mids,
+        )
+    return (
+        np.asarray(bass[pad:], dtype=np.float32),
+        np.asarray(mids[pad:], dtype=np.float32),
+    )
+
+
+def waveform_hall_of_mirrors(width: int, height: int) -> np.ndarray:
+    """Bass-anchored bass/treble edges receding into a fixed-center hall."""
+    global _wave_hall_frame, _wave_hall_scale_phase
+    w = max(2, int(width))
+    h = max(2, int(height))
+    if _wave_hall_frame.shape != (h, w):
+        _wave_hall_frame = np.zeros((h, w), dtype=np.float32)
+
+    scaled_w = max(2, int(round(w * WAVE_HALL_SHRINK)))
+    scaled_h = max(2, int(round(h * WAVE_HALL_SHRINK)))
+    if (w - scaled_w) % 2:
+        scaled_w += 1 if _wave_hall_scale_phase else -1
+    if (h - scaled_h) % 2:
+        scaled_h += 1 if _wave_hall_scale_phase else -1
+    _wave_hall_scale_phase = not _wave_hall_scale_phase
+
+    x0 = (w - scaled_w) // 2
+    y0 = (h - scaled_h) // 2
+    sx = np.rint(
+        np.arange(scaled_w, dtype=np.float32) * (w - 1) / (scaled_w - 1)
+    ).astype(np.int32)
+    sy = np.rint(
+        np.arange(scaled_h, dtype=np.float32) * (h - 1) / (scaled_h - 1)
+    ).astype(np.int32)
+    next_frame = np.zeros((h, w), dtype=np.float32)
+    next_frame[y0 : y0 + scaled_h, x0 : x0 + scaled_w] = (
+        _wave_hall_frame[np.ix_(sy, sx)] * WAVE_HALL_DECAY
+    )
+
+    stereo = prep_block(locked_window())
+    if stereo.shape[0] >= 2:
+        def add_edge(wave: np.ndarray, side: str) -> None:
+            wave = np.asarray(wave, dtype=np.float32)
+            wave = wave - float(np.mean(wave))
+            level = float(np.percentile(np.abs(wave), 95))
+            if level < WAVE_HALL_GATE:
+                return
+            vertical = side in {"left", "right"}
+            edge_size = h if vertical else w
+            source = np.arange(wave.size, dtype=np.float32)
+            target = np.linspace(
+                0.0,
+                float(wave.size - 1),
+                edge_size,
+                dtype=np.float32,
+            )
+            sampled = np.interp(target, source, wave)
+            sampled = np.convolve(
+                np.pad(sampled, (2, 2), mode="edge"),
+                WAVE_HALL_SMOOTH_KERNEL,
+                mode="valid",
+            )
+            normalized = np.clip(
+                sampled / max(level, WAVE_HALL_FULL_LEVEL),
+                -1.0,
+                1.0,
+            )
+            activity = float(
+                np.clip(
+                    (level - WAVE_HALL_GATE)
+                    / (WAVE_HALL_FULL_LEVEL - WAVE_HALL_GATE),
+                    0.0,
+                    1.0,
+                )
+            )
+            reach = (
+                WAVE_HALL_MIN_REACH
+                + (WAVE_HALL_MAX_REACH - WAVE_HALL_MIN_REACH) * activity
+            )
+            inset = np.rint(0.5 * reach * (normalized + 1.0)).astype(
+                np.int32
+            )
+            if side == "left":
+                xs = inset
+                ys = np.arange(h, dtype=np.int32)
+            elif side == "right":
+                xs = (w - 1) - inset
+                ys = np.arange(h, dtype=np.int32)
+            elif side == "top":
+                xs = np.arange(w, dtype=np.int32)
+                ys = inset
+            else:
+                xs = np.arange(w, dtype=np.int32)
+                ys = (h - 1) - inset
+            edge = _polyline_frame(xs, ys, w, h).astype(np.float32)
+            edge *= activity * activity * (3.0 - 2.0 * activity)
+            np.maximum(next_frame, edge, out=next_frame)
+
+        bass, mids = _wave_hall_frequency_edges(stereo)
+        add_edge(mids, "top")
+        add_edge(bass, "bottom")
+
+    _wave_hall_frame = next_frame
+    return np.clip(np.rint(next_frame), 0.0, 255.0).astype(np.uint8)
+
+
 def render_frame(mode: str, block: np.ndarray, width: int, height: int) -> np.ndarray:
     w, h = int(width), int(height)
     match mode:
-        case "Spectrum":
-            return lsao.live_spectrum(
-                block, CHANNEL, w, h, SPECTRUM_XLOW, SPECTRUM_XHIGH, False, 0, 0, 0, "Filled Spectrum", 1
-            )
-        case "SpectrumdB":
-            return lsao.live_spectrum_dB(
-                block, CHANNEL, w, h, 1, 13000, -80, "Filled Spectrum", 1
-            )
-        case "SpecBalance":
-            return lsao.live_spec_balance(block, w, h, 1, 13000, "Curve", 1)
-        case "Histogram":
-            return lsao.live_histogram(
-                block, CHANNEL, w, h, 64, 0.1, "Flat", "Filled Histogram", 1
-            )
-        case "Waveform":
-            tail, _, _ = ring_tail(SHORT_WINDOW)
-            if tail.shape[0] < 8:
-                tail = block
-            return smooth_scope(tail, w, h)
         case "Bass Harmonic Anchor":
             return smooth_scope(locked_window(), w, h)
+        case "Bass Harmonic Scan":
+            return bass_harmonic_scan(w, h)
         case "Spectral Seismograph":
             return spectral_seismograph(w, h)
-        case "Recurrence":
-            return lsao.live_recurrence(block, CHANNEL, w, h, 0.15, 1)
         case "Bass-anchored recurrence plot":
             return bass_anchored_recurrence(w, h)
         case "Oscilloscope":
             return xy_oscilloscope_line(block, w, h)
-        case "Polar":
-            return lsao.live_polar(
-                block, CHANNEL, w, h, 0, "C4", 1, SCOPE_DOT_THICKNESS
-            )
         case "PolarStereo":
-            return lsao.live_polar_stereo(
-                block, w, h, 0, "C4", 1, SCOPE_DOT_THICKNESS
-            )
-        case "Poincare":
-            return lsao.live_poincare(
-                block, CHANNEL, w, h, 10, 1, SCOPE_DOT_THICKNESS
-            )
+            return polar_stereo(block, w, h)
         case "DelayEmbed":
-            return lsao.live_delay_embed(
-                block,
-                STEREO,
-                w,
-                h,
-                10,
-                20,
-                0,
-                0.25,
-                1,
-                SCOPE_DOT_THICKNESS,
-            )
+            return delay_embed(block, w, h)
         case "Strange Attractor":
             return strange_attractor(block)
         case "Starfield Zoom":
             return starfield_zoom(block, w, h)
         case "Hall of Mirrors":
             return hall_of_mirrors(block, w, h)
-        case "Envelope":
-            return lsao.live_envelope(block, CHANNEL, w, h, 1, "Filled Envelope", 1)
-        case "Chladni":
-            return lsao.live_chladni(block, STEREO, w, h, CHLADNI_PLATE, 1000, 0.2, 0.5, 1)
+        case "Waveform Hall of Mirrors":
+            return waveform_hall_of_mirrors(w, h)
         case _:
             return np.zeros((h, w), dtype=np.uint8)
 
@@ -1366,7 +1680,7 @@ def _alsa_pump() -> bool:
     if not device:
         print("alsa: no USB capture card in /proc/asound/cards", flush=True)
         return False
-    rate = lsao.SAMPLERATE
+    rate = SAMPLERATE
     channels = 2
     cmd = [
         "arecord",
@@ -1429,7 +1743,7 @@ def _pulse_pump() -> None:
     if proc is None or proc.stdout is None:
         _portaudio_fallback()
         return
-    chunk = (lsao.SAMPLERATE // FPS) * 2 * 4
+    chunk = (SAMPLERATE // FPS) * 2 * 4
     while True:
         data = proc.stdout.read(chunk)
         if not data:
@@ -1446,8 +1760,8 @@ def _portaudio_fallback() -> None:
 
     source = os.environ.get("OSC_AUDIO_SOURCE", "").strip()
     kwargs = {
-        "samplerate": lsao.SAMPLERATE,
-        "blocksize": max(256, lsao.SAMPLERATE // FPS),
+        "samplerate": SAMPLERATE,
+        "blocksize": max(256, SAMPLERATE // FPS),
         "dtype": "float32",
         "callback": _audio_cb,
     }
@@ -1479,19 +1793,32 @@ class Kiosk:
         os.environ.setdefault("SDL_RENDER_SCALE_QUALITY", "0")
         pygame.init()
         pygame.mixer.quit()
-        pygame.mouse.set_visible(False)
-        pygame.event.set_allowed((pygame.QUIT, pygame.KEYDOWN))
-        pygame.display.set_caption("lsao-kiosk")
-        flags = pygame.FULLSCREEN | pygame.DOUBLEBUF
-        self.screen = pygame.display.set_mode((DISPLAY_W, DISPLAY_H), flags)
         self.clock = pygame.time.Clock()
         self._small = pygame.Surface((INTERNAL, INTERNAL))
         self._rgb = np.empty((INTERNAL, INTERNAL, 3), dtype=np.uint8)
+        self._open_display()
+
+    def _open_display(self) -> None:
+        """Create a new top-level window so labwc raises LSaO above old VLC."""
+        pygame.display.init()
+        pygame.display.set_caption("lsao-kiosk")
+        flags = pygame.FULLSCREEN | pygame.DOUBLEBUF
+        self.screen = pygame.display.set_mode((DISPLAY_W, DISPLAY_H), flags)
+        pygame.mouse.set_visible(False)
+        pygame.event.set_allowed((pygame.QUIT, pygame.KEYDOWN))
         print(
             f"pygame display={self.screen.get_size()} internal={INTERNAL}x{INTERNAL}",
             file=sys.stderr,
             flush=True,
         )
+
+    def _reopen_display(self) -> None:
+        pygame.display.quit()
+        self._open_display()
+        pygame.event.clear()
+        self._fps_n = 0
+        self._fps_t = time.perf_counter()
+        self._draw_ms = 0.0
 
     @property
     def mode(self) -> str:
@@ -1590,20 +1917,36 @@ class Kiosk:
             self._fps_t = time.perf_counter()
 
     def run(self) -> None:
+        was_paused = False
         try:
             while self._poll_input():
-                self.draw()
-                self.clock.tick(FPS)
+                if render_paused:
+                    was_paused = True
+                    self.clock.tick(10)
+                else:
+                    if was_paused:
+                        self._reopen_display()
+                        was_paused = False
+                    self.draw()
+                    self.clock.tick(FPS)
         finally:
             pygame.display.quit()
 
 
 def main() -> int:
+    signal.signal(signal.SIGUSR1, request_pause)
+    signal.signal(signal.SIGHUP, request_resume)
     signal.signal(signal.SIGUSR2, request_next)
     signal.signal(signal.SIGTERM, lambda *_: (_stop_audio_proc(), sys.exit(0)))
     open_affect_fifo()
     start_audio()
-    Kiosk().run()
+    kiosk = Kiosk()
+    READY_PATH.parent.mkdir(parents=True, exist_ok=True)
+    READY_PATH.write_text(f"{os.getpid()}\n")
+    try:
+        kiosk.run()
+    finally:
+        READY_PATH.unlink(missing_ok=True)
     return 0
 
 
