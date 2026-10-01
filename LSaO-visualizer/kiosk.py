@@ -105,7 +105,7 @@ SCAN_ECHO_SPEED = 3.2
 SCAN_ECHO_AMPLITUDE = 0.15
 SCAN_ECHO_BLUR = 0.24
 SCAN_ECHO_STAMP = 160.0
-SCAN_ECHO_LIVE_THICKNESS = 3
+SCAN_ECHO_LIVE_THICKNESS = 2
 SCAN_ECHO_GATE = 0.008
 _scan_echo_buf: np.ndarray | None = None
 _scan_echo_scratch: np.ndarray | None = None
@@ -404,6 +404,14 @@ def prep_block(block: np.ndarray) -> np.ndarray:
     return b
 
 
+def _finite_zi(zi: np.ndarray) -> np.ndarray:
+    """Replace a non-finite IIR state so one bad sample cannot poison the ring."""
+    state = np.asarray(zi, dtype=np.float64)
+    if state.size and not bool(np.all(np.isfinite(state))):
+        return np.zeros_like(state)
+    return state
+
+
 def push_audio(block: np.ndarray) -> None:
     """Keep a rolling stereo ring for Bass Harmonic Anchor (and latest_block)."""
     global latest_block, _ring_i, _ring_filled, _lp_zi, _total
@@ -411,16 +419,19 @@ def push_audio(block: np.ndarray) -> None:
     b = stereo_block(np.asarray(block, dtype=np.float32))
     if b.size == 0:
         return
+    b = np.nan_to_num(b, nan=0.0, posinf=0.0, neginf=0.0)
     latest_block = b
     n = min(int(b.shape[0]), RING_SAMPLES)
     b = b[-n:]
     mono = np.mean(b, axis=1)
     y = mono
     for k in range(TRIG_LP_POLES):
+        _lp_zi[k] = _finite_zi(_lp_zi[k])
         y, _lp_zi[k] = lfilter(_lp_b, _lp_a, y, zi=_lp_zi[k])
-    filt = np.asarray(y, dtype=np.float32)
+    filt = np.nan_to_num(np.asarray(y, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0)
     bass = b
     for k in range(FRACTAL_BASS_LP_POLES):
+        _fractal_bass_lp_zi[k] = _finite_zi(_fractal_bass_lp_zi[k])
         bass, _fractal_bass_lp_zi[k] = lfilter(
             _fractal_bass_lp_b,
             _fractal_bass_lp_a,
@@ -428,6 +439,7 @@ def push_audio(block: np.ndarray) -> None:
             axis=0,
             zi=_fractal_bass_lp_zi[k],
         )
+    _fractal_bass_hp_zi = _finite_zi(_fractal_bass_hp_zi)
     bass, _fractal_bass_hp_zi = lfilter(
         _fractal_bass_hp_b,
         _fractal_bass_hp_a,
@@ -435,7 +447,7 @@ def push_audio(block: np.ndarray) -> None:
         axis=0,
         zi=_fractal_bass_hp_zi,
     )
-    bass = np.asarray(bass, dtype=np.float32)
+    bass = np.nan_to_num(np.asarray(bass, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0)
     with _ring_lock:
         i = _ring_i
         first = min(n, RING_SAMPLES - i)
@@ -1014,6 +1026,10 @@ def _stereo_fractal_levels(
     _fractal_bass_levels[:] += (
         bass_target - _fractal_bass_levels
     ) * bass_blend
+    if not np.all(np.isfinite(_fractal_levels)):
+        _fractal_levels[:] = 0.0
+    if not np.all(np.isfinite(_fractal_bass_levels)):
+        _fractal_bass_levels[:] = 0.0
     return (
         float(_fractal_levels[0]),
         float(_fractal_levels[1]),
@@ -1032,6 +1048,10 @@ def strange_attractor(block: np.ndarray) -> np.ndarray:
     ):
         return _attractor_frame
     left, right, bass_left, bass_right = _stereo_fractal_levels(block)
+    left = max(0.0, left)
+    right = max(0.0, right)
+    bass_left = max(0.0, bass_left)
+    bass_right = max(0.0, bass_right)
     dt = (
         FRACTAL_UPDATE_S
         if _attractor_frame_time <= 0.0
@@ -1334,10 +1354,24 @@ def hall_of_mirrors(block: np.ndarray, width: int, height: int) -> np.ndarray:
         channel_rms = np.zeros(2, dtype=np.float32)
         mono = np.zeros(0, dtype=np.float32)
 
-    bass = fractal_bass_tail(FRACTAL_BASS_SAMPLES)
+    bass = np.nan_to_num(
+        fractal_bass_tail(FRACTAL_BASS_SAMPLES),
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0,
+    )
     bass_level = float(np.sqrt(np.mean(np.square(bass)))) if bass.size else 0.0
-    high = _long_bandpass(mono, 2)
+    high = np.nan_to_num(
+        _long_bandpass(mono, 2),
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0,
+    )
     high_level = float(np.sqrt(np.mean(np.square(high)))) if high.size else 0.0
+    if not math.isfinite(bass_level):
+        bass_level = 0.0
+    if not math.isfinite(high_level):
+        high_level = 0.0
     bass_target = float(np.clip(bass_level / MIRROR_BASS_FULL, 0.0, 1.0))
     high_target = float(np.clip(high_level / MIRROR_HIGH_FULL, 0.0, 1.0))
     tilt_target = float(np.clip(bass_target - high_target, -1.0, 1.0))
@@ -1361,6 +1395,14 @@ def hall_of_mirrors(block: np.ndarray, width: int, height: int) -> np.ndarray:
     _mirror_high += (high_target - _mirror_high) * (
         1.0 - math.exp(-dt / 0.08)
     )
+    if not np.all(np.isfinite(_mirror_levels)):
+        _mirror_levels[:] = 0.0
+    if not math.isfinite(_mirror_tilt):
+        _mirror_tilt = 0.0
+    if not math.isfinite(_mirror_bass):
+        _mirror_bass = 0.0
+    if not math.isfinite(_mirror_high):
+        _mirror_high = 0.0
 
     if _mirror_frame.shape != (h, w):
         _mirror_frame = np.zeros((h, w), dtype=np.float32)

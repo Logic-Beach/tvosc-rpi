@@ -39,8 +39,8 @@ VIDEO_EXTS = {
     ".mp4", ".mkv", ".avi", ".mov", ".webm", ".mpg", ".mpeg",
     ".m4v", ".wmv", ".flv", ".ts", ".m2ts", ".vob", ".ogv",
 }
-GPIO_PIN = 27
-AFFECT_PIN = 22
+GPIO_PIN = int(os.environ.get("CRT_MODE_GPIO", "27"))
+AFFECT_PIN = int(os.environ.get("CRT_AFFECT_GPIO", "22"))
 BOUNCE_S = 0.03
 SWITCH_LOCKOUT_S = 1.0
 AFFECT_LOCKOUT_S = 0.08
@@ -261,11 +261,17 @@ def videos_on(root: Path) -> list[Path]:
         for path in found
         if path.suffix.lower() == ".mp4" and path.name.startswith("SMALL_")
     }
+    small = [
+        path
+        for path in found
+        if path.suffix.lower() == ".mp4" and path.name.startswith("SMALL_")
+    ]
+    if small:
+        return sorted(small)
     return sorted(
         path
         for path in found
-        if path.name.startswith("SMALL_")
-        or (path.parent, path.stem.casefold()) not in converted
+        if (path.parent, path.stem.casefold()) not in converted
     )
 
 
@@ -347,6 +353,7 @@ def vlc_command(files: list[str], *, heavy: bool) -> list[str]:
         "--no-video-title-show",
         "--no-qt-privacy-ask",
         "--aspect-ratio", "4:3",
+        "--avcodec-hw", "none",
         "--aout", "alsa",
         "--alsa-audio-device", "plughw:0,0",
     ] + files
@@ -373,6 +380,18 @@ def kill_proc(
         except ProcessLookupError:
             pass
         proc.wait(timeout=2)
+
+
+def stop_vlc(proc: subprocess.Popen | None = None) -> None:
+    """Tear down VLC hard so a wedged Wayland window cannot trap video mode."""
+    kill_proc(proc, "vlc", timeout=0.4)
+    for name in ("vlc", "cvlc"):
+        subprocess.run(
+            ["pkill", "-x", name],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
 
 
 def spawn(
@@ -447,14 +466,17 @@ class ModeSupervisor:
             self.waiting_for_video = False
             logging.info("pending video switch cancelled")
             return
+        logging.info("gpio %s down (mode=%s)", GPIO_PIN, self.mode)
+        self.pending_video_step = 0
         self.pending_toggle = True
 
     def request_affect(self, *_args) -> None:
-        if self.affect_held:
-            return
+        # A missed release used to latch this True and ignore every later
+        # GPIO 22 press. Always treat a new falling edge as a fresh press.
         self.affect_held = True
         self.affect_long = False
         self.affect_pressed_at = time.monotonic()
+        logging.info("gpio %s down", AFFECT_PIN)
 
     def affect_held_cb(self, *_args) -> None:
         if not self.affect_held or self.affect_long:
@@ -470,6 +492,7 @@ class ModeSupervisor:
         if self.affect_held and not self.affect_long:
             held_for = time.monotonic() - self.affect_pressed_at
             self.affect(-1 if held_for >= AFFECT_HOLD_S else 1)
+        logging.info("gpio %s up", AFFECT_PIN)
         self.affect_held = False
         self.affect_long = False
 
@@ -498,20 +521,10 @@ class ModeSupervisor:
             return False
         self.waiting_for_video = False
         self.pending_video_step = 0
+        stop_vlc(self.vlc)
+        self.vlc = None
         if self.first_lsao_start:
             self.first_lsao_start = False
-            subprocess.run(
-                ["pkill", "-x", "vlc"],
-                check=False,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            subprocess.run(
-                ["pkill", "-x", "cvlc"],
-                check=False,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
             subprocess.run(
                 ["pkill", "-f", "LSaO-visualizer/kiosk.py"],
                 check=False,
@@ -528,8 +541,6 @@ class ModeSupervisor:
                 LSAO_READY.unlink(missing_ok=True)
                 self.lsao = spawn(lsao_command(), "lsao", cwd=LSAO_DIR)
         self.lsao_paused = False
-        kill_proc(self.vlc, "vlc")
-        self.vlc = None
         self.mode = "lsao"
         self.last_auto_advance = time.monotonic()
         logging.info("mode=lsao")
@@ -638,7 +649,7 @@ class ModeSupervisor:
             len(self.video_paths),
             Path(next_path).name,
         )
-        kill_proc(self.vlc, "vlc", timeout=0.75)
+        stop_vlc(self.vlc)
         self.vlc = None
         try:
             self.vlc = spawn(
@@ -686,7 +697,7 @@ class ModeSupervisor:
             self.waiting_for_video = False
             self.toggle()
         self.maybe_auto_advance()
-        if self.busy:
+        if self.busy or self.pending_toggle:
             return
         if self.mode == "video" and self.pending_video_step:
             step = self.pending_video_step
@@ -702,7 +713,12 @@ class ModeSupervisor:
         if self.mode == "lsao" and self.lsao is not None and self.lsao.poll() is not None:
             logging.warning("lsao exited (%s); restarting", self.lsao.returncode)
             self.start_lsao()
-        elif self.mode == "video" and self.vlc is not None and self.vlc.poll() is not None:
+        elif (
+            self.mode == "video"
+            and not self.pending_toggle
+            and self.vlc is not None
+            and self.vlc.poll() is not None
+        ):
             code = self.vlc.returncode
             self.vlc = None
             elapsed = time.monotonic() - self.video_started_at
@@ -756,6 +772,10 @@ def main() -> int:
 
     try:
         while True:
+            # gpiozero sometimes misses the release edge. The pin is already
+            # high again, so finish the press here or the viz button looks dead.
+            if sup.affect_held and not affect.is_pressed:
+                sup.release_affect()
             sup.reap()
             time.sleep(0.05)
     except KeyboardInterrupt:
