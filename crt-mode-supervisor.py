@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""GPIO kiosk supervisor: LSaO visualizer and USB VLC.
+"""GPIO kiosk supervisor: resident LSaO visualizer and USB VLC.
 
 GPIO 27 (header pin 13) to GND: toggle LSaO <-> USB video.
-GPIO 22 (header pin 15) to GND: short press next LSaO vis, hold to go back,
-or hold five seconds to toggle ten-second automatic cycling (ignored during
-video).
+GPIO 22 (header pin 15) to GND: short press next, hold to go back. In LSaO,
+a five-second hold toggles ten-second automatic cycling.
 Boot default is LSaO.
 """
 
@@ -34,20 +33,20 @@ CACHE_DIR = HOME / ".cache" / "crt-videos"
 LOG_PATH = HOME / ".local/state/crt-mode.log"
 PIDFILE = HOME / ".local/state/crt-mode.pid"
 LSAO_FIFO = HOME / ".local/state/lsao-next"
+LSAO_READY = HOME / ".local/state/lsao-ready"
 PREFERRED_LABELS = ("NO_NAME", "no_name", "NONAME")
 VIDEO_EXTS = {
     ".mp4", ".mkv", ".avi", ".mov", ".webm", ".mpg", ".mpeg",
     ".m4v", ".wmv", ".flv", ".ts", ".m2ts", ".vob", ".ogv",
 }
-GPIO_PIN = 27
-AFFECT_PIN = 22
+GPIO_PIN = int(os.environ.get("CRT_MODE_GPIO", "27"))
+AFFECT_PIN = int(os.environ.get("CRT_AFFECT_GPIO", "22"))
 BOUNCE_S = 0.03
 SWITCH_LOCKOUT_S = 1.0
 AFFECT_LOCKOUT_S = 0.08
 AFFECT_HOLD_S = 0.4
 AFFECT_AUTO_HOLD_S = 5.0
 AUTO_CYCLE_S = 10.0
-HEAVY_PIXELS = 1280 * 720
 LSAO_DIR = HOME / "LSaO-visualizer"
 
 
@@ -254,7 +253,26 @@ def videos_on(root: Path) -> list[Path]:
                     found.append(Path(dirpath) / name)
     except OSError as exc:
         logging.warning("scan failed for %s: %s", root, exc)
-    return sorted(found)
+
+    # The offline converter writes SMALL_name.mp4 beside name.mkv/name.webm.
+    # Prefer that Pi-friendly copy without showing both versions in VLC.
+    converted = {
+        (path.parent, path.stem.removeprefix("SMALL_").casefold())
+        for path in found
+        if path.suffix.lower() == ".mp4" and path.name.startswith("SMALL_")
+    }
+    small = [
+        path
+        for path in found
+        if path.suffix.lower() == ".mp4" and path.name.startswith("SMALL_")
+    ]
+    if small:
+        return sorted(small)
+    return sorted(
+        path
+        for path in found
+        if (path.parent, path.stem.casefold()) not in converted
+    )
 
 
 def find_usb_videos() -> tuple[Path | None, list[Path]]:
@@ -271,16 +289,20 @@ def find_usb_videos() -> tuple[Path | None, list[Path]]:
     if not usb_mounts:
         usb_mounts = mounts
 
+    # Scan each mount once. The old ranking pass recursively scanned every
+    # drive and then scanned the selected drive again.
+    libraries = {mount: videos_on(mount) for mount in usb_mounts}
+
     def rank(path: Path) -> tuple[int, str]:
         name = path.name
         if name in PREFERRED_LABELS or name.upper() == "NO_NAME":
             return (0, name.lower())
-        vids = videos_on(path)
+        vids = libraries[path]
         return (1 if vids else 2, name.lower())
 
     usb_mounts.sort(key=rank)
     for mount in usb_mounts:
-        vids = videos_on(mount)
+        vids = libraries[mount]
         if vids:
             return mount, vids
     if usb_mounts:
@@ -298,105 +320,23 @@ def cache_path(src: Path) -> Path:
     return CACHE_DIR / f"{digest}.mp4"
 
 
-def video_is_heavy(src: Path) -> bool:
-    try:
-        out = subprocess.check_output(
-            [
-                "ffprobe", "-v", "error", "-select_streams", "v:0",
-                "-show_entries", "stream=width,height",
-                "-of", "csv=p=0", str(src),
-            ],
-            text=True,
-            timeout=15,
-            stderr=subprocess.DEVNULL,
-        ).strip()
-        parts = [p for p in out.replace("|", ",").split(",") if p]
-        w, h = int(parts[0]), int(parts[1])
-        return (w * h) > HEAVY_PIXELS
-    except Exception:
-        return True
-
-
-def transcode_to_cache(src: Path) -> Path | None:
-    dest = cache_path(src)
-    if dest.is_file() and dest.stat().st_size > 2048:
-        return dest
-    if not video_is_heavy(src):
+def immediate_playable_path(src: Path) -> Path:
+    """Choose an existing cache if available, without probing or converting."""
+    if src.suffix.lower() == ".mp4" and src.name.startswith("SMALL_"):
         return src
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    tmp = dest.with_suffix(".tmp.mp4")
-    logging.info("transcoding %s for CRT cache", src.name)
-    cmd = [
-        "nice", "-n", "15",
-        "ffmpeg", "-hide_banner", "-nostdin", "-y",
-        "-i", str(src),
-        "-vf", "scale=720:480:force_original_aspect_ratio=decrease,pad=720:480:(ow-iw)/2:(oh-ih)/2",
-        "-r", "24",
-        "-c:v", "libx264", "-preset", "ultrafast", "-tune", "fastdecode",
-        "-profile:v", "baseline", "-level", "3.0", "-pix_fmt", "yuv420p",
-        "-crf", "28",
-        "-c:a", "aac", "-ac", "2", "-ar", "44100", "-b:a", "96k",
-        "-movflags", "+faststart",
-        str(tmp),
-    ]
-    try:
-        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        tmp.replace(dest)
-        logging.info("cache ready: %s", dest)
-        return dest
-    except Exception as exc:
-        logging.warning("transcode failed for %s: %s", src.name, exc)
-        try:
-            tmp.unlink(missing_ok=True)
-        except OSError:
-            pass
-        return None
-
-
-def playable_path(src: Path) -> tuple[Path | None, str]:
-    """Return (path, kind) where kind is full, proxy, or none."""
     full = cache_path(src)
-    if full.is_file() and full.stat().st_size > 2048:
-        return full, "full"
-    proxy = full.with_suffix(".proxy.mp4")
-    if proxy.is_file() and proxy.stat().st_size > 2048:
-        return proxy, "proxy"
-    if not video_is_heavy(src):
-        return src, "original"
-    return None, "none"
-
-
-def transcode_proxy(src: Path) -> Path | None:
-    """Fast keyframe-only 720x480 proxy so VLC can start playing."""
-    dest = cache_path(src).with_suffix(".proxy.mp4")
-    if dest.is_file() and dest.stat().st_size > 2048:
-        return dest
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    tmp = dest.with_suffix(".tmp.mp4")
-    logging.info("building CRT proxy for %s", src.name)
-    cmd = [
-        "nice", "-n", "5",
-        "ffmpeg", "-hide_banner", "-nostdin", "-y",
-        "-skip_frame", "nokey",
-        "-i", str(src),
-        "-an",
-        "-vf", "scale=720:480:force_original_aspect_ratio=decrease,pad=720:480:(ow-iw)/2:(oh-ih)/2",
-        "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
-        "-crf", "32",
-        str(tmp),
-    ]
     try:
-        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        tmp.replace(dest)
-        logging.info("proxy ready: %s", dest)
-        return dest
-    except Exception as exc:
-        logging.warning("proxy failed for %s: %s", src.name, exc)
-        try:
-            tmp.unlink(missing_ok=True)
-        except OSError:
-            pass
-        return None
+        if full.is_file() and full.stat().st_size > 2048:
+            return full
+    except OSError:
+        pass
+    proxy = full.with_suffix(".proxy.mp4")
+    try:
+        if proxy.is_file() and proxy.stat().st_size > 2048:
+            return proxy
+    except OSError:
+        pass
+    return src
 
 
 def vlc_command(files: list[str], *, heavy: bool) -> list[str]:
@@ -408,16 +348,23 @@ def vlc_command(files: list[str], *, heavy: bool) -> list[str]:
         "--intf", "dummy",
         "--fullscreen",
         "--no-video-deco",
-        "--loop",
+        "--play-and-exit",
         "--no-osd",
         "--no-video-title-show",
         "--no-qt-privacy-ask",
         "--aspect-ratio", "4:3",
-        "--aout", "pulse",
+        "--avcodec-hw", "none",
+        "--aout", "alsa",
+        "--alsa-audio-device", "plughw:0,0",
     ] + files
 
 
-def kill_proc(proc: subprocess.Popen | None, name: str) -> None:
+def kill_proc(
+    proc: subprocess.Popen | None,
+    name: str,
+    *,
+    timeout: float = 3.0,
+) -> None:
     if proc is None or proc.poll() is not None:
         return
     try:
@@ -425,7 +372,7 @@ def kill_proc(proc: subprocess.Popen | None, name: str) -> None:
     except ProcessLookupError:
         return
     try:
-        proc.wait(timeout=3)
+        proc.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
         logging.warning("force-killing %s", name)
         try:
@@ -435,18 +382,39 @@ def kill_proc(proc: subprocess.Popen | None, name: str) -> None:
         proc.wait(timeout=2)
 
 
-def spawn(cmd: list[str], name: str, cwd: Path | None = None) -> subprocess.Popen:
+def stop_vlc(proc: subprocess.Popen | None = None) -> None:
+    """Tear down VLC hard so a wedged Wayland window cannot trap video mode."""
+    kill_proc(proc, "vlc", timeout=0.4)
+    for name in ("vlc", "cvlc"):
+        subprocess.run(
+            ["pkill", "-x", name],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+
+def spawn(
+    cmd: list[str],
+    name: str,
+    cwd: Path | None = None,
+) -> subprocess.Popen:
     logging.info("starting %s: %s", name, " ".join(cmd[:12]) + (" ..." if len(cmd) > 12 else ""))
     env = os.environ.copy()
     env.setdefault("GDK_BACKEND", "x11")
-    return subprocess.Popen(
-        cmd,
-        start_new_session=True,
-        stdout=subprocess.DEVNULL,
-        stderr=open(LOG_PATH, "a"),
-        env=env,
-        cwd=str(cwd) if cwd else None,
-    )
+    log_file = open(LOG_PATH, "a")
+    try:
+        return subprocess.Popen(
+            cmd,
+            start_new_session=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=log_file,
+            env=env,
+            cwd=str(cwd) if cwd else None,
+        )
+    finally:
+        log_file.close()
 
 
 class ModeSupervisor:
@@ -454,39 +422,68 @@ class ModeSupervisor:
         self.mode = "lsao"
         self.vlc: subprocess.Popen | None = None
         self.lsao: subprocess.Popen | None = None
+        self.lsao_paused = False
         self.last_switch = 0.0
         self.last_affect = 0.0
         self.busy = False
         self.pending_toggle = False
-        self.pending_affect = False
+        self.pending_video_step = 0
         self.affect_held = False
         self.affect_long = False
         self.affect_pressed_at = 0.0
         self.auto_cycle = False
         self.last_auto_advance = time.monotonic()
-        self.playing_cached = False
+        self.first_lsao_start = True
+        self.media_root: Path | None = None
         self.current_sources: list[Path] = []
-        self.stop_transcode = threading.Event()
-        self.transcode_thread = threading.Thread(
-            target=self._transcode_loop, name="crt-transcode", daemon=True
+        self.video_paths: list[str] = []
+        self.video_index = 0
+        self.video_started_at = 0.0
+        self.video_fail_streak = 0
+        self.media_lock = threading.Lock()
+        self.media_ready = threading.Event()
+        self.waiting_for_video = False
+        self.stop_media = threading.Event()
+        self.media_thread = threading.Thread(
+            target=self._media_loop, name="crt-media-index", daemon=True
         )
-        self.transcode_thread.start()
+        self.media_thread.start()
+
+    def lsao_is_ready(self) -> bool:
+        proc = self.lsao
+        if proc is None or proc.poll() is not None:
+            return False
+        try:
+            return int(LSAO_READY.read_text().strip()) == proc.pid
+        except (OSError, ValueError):
+            return False
 
     def request_toggle(self) -> None:
         now = time.time()
         if self.pending_toggle or (now - self.last_switch) < SWITCH_LOCKOUT_S:
             return
+        if self.waiting_for_video:
+            self.waiting_for_video = False
+            logging.info("pending video switch cancelled")
+            return
+        logging.info("gpio %s down (mode=%s)", GPIO_PIN, self.mode)
+        self.pending_video_step = 0
         self.pending_toggle = True
 
     def request_affect(self, *_args) -> None:
-        if self.affect_held:
-            return
+        # A missed release used to latch this True and ignore every later
+        # GPIO 22 press. Always treat a new falling edge as a fresh press.
         self.affect_held = True
         self.affect_long = False
         self.affect_pressed_at = time.monotonic()
+        logging.info("gpio %s down", AFFECT_PIN)
 
     def affect_held_cb(self, *_args) -> None:
         if not self.affect_held or self.affect_long:
+            return
+        # In video mode every hold means "previous", including a 5+ second
+        # hold. Automatic cycling only applies to visualizers.
+        if self.mode == "video":
             return
         self.affect_long = True
         self.toggle_auto_cycle()
@@ -495,6 +492,7 @@ class ModeSupervisor:
         if self.affect_held and not self.affect_long:
             held_for = time.monotonic() - self.affect_pressed_at
             self.affect(-1 if held_for >= AFFECT_HOLD_S else 1)
+        logging.info("gpio %s up", AFFECT_PIN)
         self.affect_held = False
         self.affect_long = False
 
@@ -517,92 +515,86 @@ class ModeSupervisor:
         if (time.monotonic() - self.last_auto_advance) >= AUTO_CYCLE_S:
             self.affect(1)
 
-    def kill_visuals(self) -> None:
-        kill_proc(self.lsao, "lsao")
-        self.lsao = None
-        kill_proc(self.vlc, "vlc")
-        self.vlc = None
-        subprocess.run(["pkill", "-x", "vlc"], check=False)
-        subprocess.run(["pkill", "-x", "cvlc"], check=False)
-        subprocess.run(["pkill", "-x", "osc_braille"], check=False)
-        subprocess.run(["pkill", "-f", "title=oscilloscope"], check=False)
-        subprocess.run(["pkill", "-f", "LSaO-visualizer/kiosk.py"], check=False)
-
     def start_lsao(self) -> bool:
         if not (LSAO_DIR / "kiosk.py").is_file():
             logging.warning("LSaO kiosk missing at %s; staying on current mode", LSAO_DIR)
             return False
-        self.kill_visuals()
-        self.playing_cached = False
-        time.sleep(0.3)
-        self.lsao = spawn(lsao_command(), "lsao", cwd=LSAO_DIR)
+        self.waiting_for_video = False
+        self.pending_video_step = 0
+        stop_vlc(self.vlc)
+        self.vlc = None
+        if self.first_lsao_start:
+            self.first_lsao_start = False
+            subprocess.run(
+                ["pkill", "-f", "LSaO-visualizer/kiosk.py"],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        if self.lsao is None or self.lsao.poll() is not None:
+            LSAO_READY.unlink(missing_ok=True)
+            self.lsao = spawn(lsao_command(), "lsao", cwd=LSAO_DIR)
+        elif self.lsao_is_ready():
+            try:
+                self.lsao.send_signal(signal.SIGHUP)
+            except ProcessLookupError:
+                LSAO_READY.unlink(missing_ok=True)
+                self.lsao = spawn(lsao_command(), "lsao", cwd=LSAO_DIR)
+        self.lsao_paused = False
         self.mode = "lsao"
         self.last_auto_advance = time.monotonic()
         logging.info("mode=lsao")
         return True
 
     def start_video(self) -> bool:
-        root, videos = find_usb_videos()
+        with self.media_lock:
+            root = self.media_root
+            videos = list(self.current_sources)
+        if not self.media_ready.is_set():
+            self.waiting_for_video = True
+            logging.info("USB index is still loading; video will open when ready")
+            return False
         if not videos:
             logging.warning(
                 "no videos on USB (mount=%s); staying on LSaO",
                 root,
             )
             return False
-        kill_proc(self.lsao, "lsao")
-        self.lsao = None
-        subprocess.run(["pkill", "-x", "osc_braille"], check=False)
-        subprocess.run(["pkill", "-f", "title=oscilloscope"], check=False)
-        subprocess.run(["pkill", "-f", "LSaO-visualizer/kiosk.py"], check=False)
-        time.sleep(0.3)
-        subprocess.run(["pkill", "-x", "ffmpeg"], check=False)
-        self.current_sources = videos
-        paths: list[str] = []
-        kinds: list[str] = []
-        for src in videos:
-            play, kind = playable_path(src)
-            if play is None:
-                logging.info("no CRT-sized copy yet for %s; building proxy", src.name)
-                play = transcode_proxy(src)
-                kind = "proxy" if play else "none"
-            if play is None:
-                logging.warning("cannot play %s on this Pi yet", src.name)
-                continue
-            paths.append(str(play))
-            kinds.append(kind)
-        if not paths:
-            logging.warning("no playable CRT copies; staying on LSaO")
-            self.start_lsao()
-            return False
-        self.playing_cached = all(k in {"full", "original"} for k in kinds)
+        self.waiting_for_video = False
+        paths = [str(immediate_playable_path(src)) for src in videos]
+        if paths != self.video_paths:
+            self.video_paths = paths
+            self.video_index = 0
+        else:
+            self.video_index %= len(self.video_paths)
         logging.info(
-            "USB library %s (%d files, kinds=%s)",
-            root, len(paths), ",".join(kinds),
+            "USB library %s (%d files); opening %d: %s",
+            root,
+            len(paths),
+            self.video_index + 1,
+            Path(self.video_paths[self.video_index]).name,
         )
-        cmd = vlc_command(paths, heavy=False)
-        self.vlc = spawn(cmd, "vlc")
+        cmd = vlc_command(
+            [self.video_paths[self.video_index]],
+            heavy=False,
+        )
+        try:
+            self.vlc = spawn(cmd, "vlc")
+            self.video_started_at = time.monotonic()
+            self.video_fail_streak = 0
+        except Exception:
+            if self.lsao_is_ready():
+                self.lsao.send_signal(signal.SIGHUP)
+            raise
+        if self.lsao_is_ready():
+            # Keep pygame, NumPy/SciPy and the ALSA capture process warm. The
+            # frozen visualizer window remains behind VLC and is ready as soon
+            # as VLC exits.
+            self.lsao.send_signal(signal.SIGUSR1)
+            self.lsao_paused = True
         self.mode = "video"
         logging.info("mode=video")
         return True
-
-    def maybe_hotswap_cache(self) -> None:
-        if self.mode != "video" or self.playing_cached or not self.current_sources:
-            return
-        paths: list[str] = []
-        for src in self.current_sources:
-            play, kind = playable_path(src)
-            if kind != "full" and video_is_heavy(src):
-                return
-            if play is None:
-                return
-            paths.append(str(play))
-        logging.info("full SD cache ready; restarting VLC")
-        kill_proc(self.vlc, "vlc")
-        subprocess.run(["pkill", "-x", "vlc"], check=False)
-        subprocess.run(["pkill", "-x", "cvlc"], check=False)
-        time.sleep(0.2)
-        self.playing_cached = True
-        self.vlc = spawn(vlc_command(paths, heavy=False), "vlc")
 
     def toggle(self) -> None:
         now = time.time()
@@ -621,30 +613,56 @@ class ModeSupervisor:
         finally:
             self.busy = False
 
-    def _transcode_loop(self) -> None:
-        while not self.stop_transcode.is_set():
-            if self.mode == "video" and not self.playing_cached:
-                if self.stop_transcode.wait(2.0):
-                    return
-                continue
+    def _media_loop(self) -> None:
+        """Mount and index USB media away from the GPIO/button path."""
+        while not self.stop_media.is_set():
             try:
-                _, videos = find_usb_videos()
-                for src in videos:
-                    if self.stop_transcode.is_set():
-                        return
-                    if self.mode == "video" and not self.playing_cached:
-                        break
-                    if cache_path(src).is_file():
-                        continue
-                    if not video_is_heavy(src):
-                        continue
-                    if not cache_path(src).with_suffix(".proxy.mp4").is_file():
-                        transcode_proxy(src)
-                    transcode_to_cache(src)
+                root, videos = find_usb_videos()
+                with self.media_lock:
+                    changed = (
+                        root != self.media_root
+                        or videos != self.current_sources
+                    )
+                    self.media_root = root
+                    self.current_sources = videos
+                self.media_ready.set()
+                if changed:
+                    logging.info(
+                        "USB index ready: %s (%d videos)", root, len(videos)
+                    )
             except Exception:
-                logging.exception("transcode loop error")
-            if self.stop_transcode.wait(10.0):
+                logging.exception("USB index refresh failed")
+                self.media_ready.set()
+            if self.stop_media.wait(5.0):
                 return
+
+    def switch_video(self, step: int) -> bool:
+        if not self.video_paths:
+            return False
+        next_index = (self.video_index + (-1 if step < 0 else 1)) % len(
+            self.video_paths
+        )
+        next_path = self.video_paths[next_index]
+        logging.info(
+            "video: opening %d/%d: %s",
+            next_index + 1,
+            len(self.video_paths),
+            Path(next_path).name,
+        )
+        stop_vlc(self.vlc)
+        self.vlc = None
+        try:
+            self.vlc = spawn(
+                vlc_command([next_path], heavy=False),
+                "vlc",
+            )
+        except Exception:
+            logging.exception("failed to start selected video")
+            self.start_lsao()
+            return False
+        self.video_index = next_index
+        self.video_started_at = time.monotonic()
+        return True
 
     def affect(self, step: int = 1) -> None:
         now = time.time()
@@ -659,6 +677,9 @@ class ModeSupervisor:
             else:
                 poke_lsao(b"n")
                 logging.info("lsao: next visualizer")
+        elif self.mode == "video":
+            self.last_affect = now
+            self.pending_video_step = -1 if step < 0 else 1
         else:
             logging.info("affect ignored in mode=%s", self.mode)
 
@@ -666,17 +687,59 @@ class ModeSupervisor:
         if self.pending_toggle:
             self.pending_toggle = False
             self.toggle()
+        if (
+            self.waiting_for_video
+            and self.media_ready.is_set()
+            and self.mode == "lsao"
+            and not self.busy
+            and (time.time() - self.last_switch) >= SWITCH_LOCKOUT_S
+        ):
+            self.waiting_for_video = False
+            self.toggle()
         self.maybe_auto_advance()
-        if self.busy:
+        if self.busy or self.pending_toggle:
             return
-        if self.mode == "video":
-            self.maybe_hotswap_cache()
+        if self.mode == "video" and self.pending_video_step:
+            step = self.pending_video_step
+            self.pending_video_step = 0
+            self.switch_video(step)
+        if (
+            self.mode == "video"
+            and not self.lsao_paused
+            and self.lsao_is_ready()
+        ):
+            self.lsao.send_signal(signal.SIGUSR1)
+            self.lsao_paused = True
         if self.mode == "lsao" and self.lsao is not None and self.lsao.poll() is not None:
             logging.warning("lsao exited (%s); restarting", self.lsao.returncode)
             self.start_lsao()
-        elif self.mode == "video" and self.vlc is not None and self.vlc.poll() is not None:
-            logging.warning("vlc exited (%s); returning to LSaO", self.vlc.returncode)
-            self.start_lsao()
+        elif (
+            self.mode == "video"
+            and not self.pending_toggle
+            and self.vlc is not None
+            and self.vlc.poll() is not None
+        ):
+            code = self.vlc.returncode
+            self.vlc = None
+            elapsed = time.monotonic() - self.video_started_at
+            if elapsed < 2.0:
+                self.video_fail_streak += 1
+                logging.warning(
+                    "vlc exited (%s) after %.2fs; skipping to next",
+                    code,
+                    elapsed,
+                )
+            else:
+                self.video_fail_streak = 0
+                logging.info("video finished; opening next")
+            if (
+                not self.video_paths
+                or self.video_fail_streak >= len(self.video_paths)
+            ):
+                logging.warning("no playable videos left; returning to LSaO")
+                self.start_lsao()
+                return
+            self.switch_video(1)
 
 
 def main() -> int:
@@ -684,7 +747,6 @@ def main() -> int:
     wait_for_session()
     _pid_lock_fd = acquire_pidfile()  # flock held until this process exits
     logging.info("crt-mode supervisor starting (GPIO %s mode, GPIO %s affect)", GPIO_PIN, AFFECT_PIN)
-    ensure_usb_mounted()
     sup = ModeSupervisor()
     sup.start_lsao()
 
@@ -704,18 +766,22 @@ def main() -> int:
     signal.signal(signal.SIGUSR2, lambda *_: sup.affect(1))
     logging.info(
         "GPIO %s toggles LSaO/VLC; GPIO %s short=next, hold=previous, "
-        "5s=toggle 10s auto cycle",
+        "5s in LSaO=toggle 10s auto cycle",
         GPIO_PIN, AFFECT_PIN,
     )
 
     try:
         while True:
+            # gpiozero sometimes misses the release edge. The pin is already
+            # high again, so finish the press here or the viz button looks dead.
+            if sup.affect_held and not affect.is_pressed:
+                sup.release_affect()
             sup.reap()
             time.sleep(0.05)
     except KeyboardInterrupt:
         logging.info("stopping")
     finally:
-        sup.stop_transcode.set()
+        sup.stop_media.set()
         kill_proc(sup.vlc, "vlc")
         kill_proc(sup.lsao, "lsao")
         button.close()
